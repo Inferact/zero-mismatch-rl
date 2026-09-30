@@ -1,0 +1,667 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
+import warnings
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+import torch
+
+from megatron.core.models.common.embeddings import apply_rotary_pos_emb
+from megatron.core.models.common.embeddings import rope_utils as rope_utils_module
+from megatron.core.models.common.embeddings import should_use_fused_mla_rope
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_torch_min_version
+from tests.unit_tests.test_utilities import Utils
+
+try:
+    from megatron.core.fusions.fused_mla_yarn_rope_apply import (
+        fused_mla_rope_concat,
+        fused_mla_rope_inplace,
+        fused_mla_rope_kv_split,
+        fused_mla_rope_out_of_place,
+    )
+except Exception:
+    fused_mla_rope_concat = None
+    fused_mla_rope_inplace = None
+    fused_mla_rope_kv_split = None
+    fused_mla_rope_out_of_place = None
+
+
+@pytest.mark.parametrize(
+    ("apply_rope_fusion", "rope_type", "rotary_percent", "expected"),
+    [
+        (False, "rope", 1.0, False),
+        (True, "rope", 1.0, True),
+        (True, "rope", 0.5, False),
+        (True, "yarn", 0.5, True),
+    ],
+)
+def test_mla_rope_fusion_selection(apply_rope_fusion, rope_type, rotary_percent, expected):
+    """Partial standard RoPE falls back while full RoPE and YaRN retain fusion."""
+    config = SimpleNamespace(
+        apply_rope_fusion=apply_rope_fusion, rope_type=rope_type, rotary_percent=rotary_percent
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        assert should_use_fused_mla_rope(config) is expected
+
+
+def test_partial_standard_rope_fallback_warns_once(monkeypatch):
+    """Partial standard RoPE reports its performance fallback only once."""
+    config = SimpleNamespace(apply_rope_fusion=True, rope_type="rope", rotary_percent=0.5)
+    monkeypatch.setattr(rope_utils_module, "_ROPE_FUSION_FALLBACK_WARNINGS", set())
+
+    with pytest.warns(UserWarning, match="Falling back to the unfused path"):
+        assert not should_use_fused_mla_rope(config)
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        assert not should_use_fused_mla_rope(config)
+    assert not recorded
+
+
+def dtype_tols(dtype):
+    if dtype == torch.float32:
+        return dict(rtol=1.0e-6, atol=1.0e-6)
+    elif dtype == torch.float16:
+        return dict(rtol=3.0e-3, atol=1.0e-5)
+    elif dtype == torch.bfloat16:
+        return dict(rtol=2.0e-2, atol=5.0e-2)
+    else:
+        raise ValueError(f"Unsuppored dtype ({dtype})")
+
+
+class FakeCPGroup:
+    def __init__(self, size=1, rank=0):
+        self._size = size
+        self._rank = rank
+
+    def size(self):
+        return self._size
+
+    def rank(self):
+        return self._rank
+
+
+class _SaveOutputForBackward(torch.autograd.Function):
+    """Minimal stand-in for a kernel whose backward consumes its output."""
+
+    @staticmethod
+    def forward(ctx, tensor):
+        output = tensor.clone()
+        ctx.save_for_backward(output)
+        return output
+
+    @staticmethod
+    def backward(ctx, _grad_output):
+        (saved_output,) = ctx.saved_tensors
+        return saved_output
+
+
+def _test_fused_mla_rope_inplace(
+    input_format, inverse=False, remove_interleaving=False, rope_first=False
+):
+    assert fused_mla_rope_inplace is not None
+    num_heads = 32
+    q_dim = 128
+    emb_dim = 64
+    dtype = torch.bfloat16
+    transformer_config = TransformerConfig(
+        num_attention_heads=num_heads,
+        num_layers=1,
+        rotary_interleaved=False,
+        multi_latent_attention=True,
+    )
+
+    max_seqlen = None
+    if input_format == "sbhd":
+        cu_seqlens = None
+        seqlen = 1024
+        batch_size = 2
+        yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=seqlen)
+        freqs, mscale = yarn_rope(seqlen, 0)
+        cos = (torch.cos(freqs) * mscale).to(dtype)
+        sin = (torch.sin(freqs) * mscale).to(dtype)
+
+        pytorch_fwd_input = torch.randn(
+            (seqlen, batch_size, num_heads, q_dim + emb_dim), dtype=dtype, device='cuda'
+        )
+        pytorch_bwd_input = torch.randn(
+            (seqlen, batch_size, num_heads, q_dim + emb_dim), dtype=dtype, device='cuda'
+        )
+    else:
+        cu_seqlens = [0, 27, 54, 99, 128]
+        total_seqlen = cu_seqlens[-1]
+        max_seqlen = 0
+        for i in range(len(cu_seqlens) - 1):
+            max_seqlen = max(max_seqlen, cu_seqlens[i + 1] - cu_seqlens[i])
+        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device='cuda')
+        yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=max_seqlen)
+        freqs, mscale = yarn_rope(max_seqlen, 0)
+        cos = (torch.cos(freqs) * mscale).to(dtype)
+        sin = (torch.sin(freqs) * mscale).to(dtype)
+
+        pytorch_fwd_input = torch.randn(
+            (total_seqlen, num_heads, q_dim + emb_dim), dtype=dtype, device='cuda'
+        )
+        pytorch_bwd_input = torch.randn(
+            (total_seqlen, num_heads, q_dim + emb_dim), dtype=dtype, device='cuda'
+        )
+
+    pytorch_fwd_input.requires_grad_(True)
+    fused_fwd_input = pytorch_fwd_input.detach().clone()
+    fused_fwd_input.requires_grad_(True)
+    fused_bwd_input = pytorch_bwd_input.detach().clone()
+
+    if rope_first:
+        pe, no_pe = torch.split(pytorch_fwd_input, [emb_dim, q_dim], dim=-1)
+    else:
+        no_pe, pe = torch.split(pytorch_fwd_input, [q_dim, emb_dim], dim=-1)
+    pe_output = apply_rotary_pos_emb(
+        pe,
+        freqs,
+        transformer_config,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
+        mscale=mscale,
+        cp_group=FakeCPGroup(),
+        mla_rotary_interleaved=True,
+        inverse=inverse,
+        mla_output_remove_interleaving=remove_interleaving,
+    )
+    pytorch_output = (
+        torch.concat([pe_output, no_pe], dim=-1)
+        if rope_first
+        else torch.concat([no_pe, pe_output], dim=-1)
+    )
+    pytorch_output.backward(pytorch_bwd_input, retain_graph=True)
+
+    fused_output = fused_mla_rope_inplace(
+        fused_fwd_input,
+        cos,
+        sin,
+        q_dim,
+        emb_dim,
+        cu_seqlens_q=cu_seqlens,
+        inverse=inverse,
+        remove_interleaving=remove_interleaving,
+        rope_first=rope_first,
+    )
+    fused_output.backward(fused_bwd_input, retain_graph=True)
+
+    tols = dtype_tols(dtype)
+    torch.testing.assert_close(
+        pytorch_output.float(),
+        fused_output.float(),
+        msg=lambda msg: f"Mismatch in fwd: {msg}",
+        **tols,
+    )
+    torch.testing.assert_close(
+        pytorch_fwd_input.grad.float(),
+        fused_fwd_input.grad.float(),
+        msg=lambda msg: f"Mismatch in bwd: {msg}",
+        **tols,
+    )
+    nope_slice = slice(emb_dim, None) if rope_first else slice(0, q_dim)
+    torch.testing.assert_close(
+        fused_output[..., nope_slice], pytorch_fwd_input.detach()[..., nope_slice], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        fused_fwd_input.grad[..., nope_slice], pytorch_bwd_input[..., nope_slice], rtol=0, atol=0
+    )
+
+
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("inverse", [False, True])
+@pytest.mark.parametrize(
+    "sequence_lengths,global_start,local_rows",
+    [
+        pytest.param([8], -2, 12, id="single-sequence-boundary-and-tail-padding"),
+        pytest.param([0, 1, 0, 3, 0, 5], -2, 13, id="zero-length-sequences"),
+        pytest.param([1] * 257, -2, 261, id="many-short-sequences"),
+    ],
+)
+def test_mla_rope_contiguous_thd_global_start_matches_position_ids(
+    inverse, sequence_lengths, global_start, local_rows
+):
+    """Kernel-side THD row mapping must match explicit packed-sequence positions."""
+    assert fused_mla_rope_inplace is not None
+    torch.manual_seed(1234)
+
+    sequence_lengths = torch.tensor(sequence_lengths, dtype=torch.int32, device="cuda")
+    cu_seqlens = torch.cat(
+        (torch.zeros(1, dtype=torch.int32, device="cuda"), sequence_lengths.cumsum(dim=0))
+    )
+    global_rows = torch.arange(
+        global_start, global_start + local_rows, dtype=torch.int32, device="cuda"
+    )
+    sequence_ids = torch.bucketize(
+        global_rows, cu_seqlens[1:], out_int32=True, right=True
+    ).clamp_max(cu_seqlens.numel() - 2)
+    sequence_starts = cu_seqlens[sequence_ids]
+    sequence_ends = cu_seqlens[sequence_ids + 1]
+    valid_rows = (global_rows >= sequence_starts) & (global_rows < sequence_ends)
+    position_ids = torch.where(valid_rows, global_rows - sequence_starts, 0)
+
+    nope_dim = 4
+    emb_dim = 8
+    num_heads = 2
+    max_sequence_length = max(sequence_lengths.max().item(), 1)
+    freqs = torch.randn(max_sequence_length, emb_dim, dtype=torch.float32, device="cuda")
+    cos = freqs.cos().contiguous()
+    sin = freqs.sin().contiguous()
+    values = torch.randn(
+        local_rows, num_heads, nope_dim + emb_dim, dtype=torch.float32, device="cuda"
+    )
+    position_input = values.clone().requires_grad_(True)
+    contiguous_input = values.clone().requires_grad_(True)
+
+    position_output = fused_mla_rope_inplace(
+        position_input,
+        cos,
+        sin,
+        nope_dim,
+        emb_dim,
+        cu_seqlens_q=cu_seqlens,
+        inverse=inverse,
+        remove_interleaving=True,
+        position_ids=position_ids,
+    )
+    contiguous_output = fused_mla_rope_inplace(
+        contiguous_input,
+        cos,
+        sin,
+        nope_dim,
+        emb_dim,
+        cu_seqlens_q=cu_seqlens,
+        inverse=inverse,
+        remove_interleaving=True,
+        thd_global_start=global_start,
+    )
+
+    torch.testing.assert_close(contiguous_output, position_output)
+    grad = torch.randn_like(position_output)
+    position_output.backward(grad.clone())
+    contiguous_output.backward(grad.clone())
+    torch.testing.assert_close(contiguous_input.grad, position_input.grad)
+
+
+def _test_fused_mla_rope_kv_split(input_format, remove_interleaving=False):
+    assert fused_mla_rope_kv_split is not None
+    num_heads = 32
+    k_dim = 128
+    v_dim = 128
+    emb_dim = 64
+    dtype = torch.bfloat16
+    transformer_config = TransformerConfig(
+        num_attention_heads=num_heads,
+        num_layers=1,
+        rotary_interleaved=False,
+        multi_latent_attention=True,
+    )
+
+    max_seqlen = None
+    if input_format == "sbhd":
+        cu_seqlens = None
+        seqlen = 1024
+        batch_size = 2
+        yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=seqlen)
+        freqs, mscale = yarn_rope(seqlen, 0)
+        cos = (torch.cos(freqs) * mscale).to(dtype)
+        sin = (torch.sin(freqs) * mscale).to(dtype)
+
+        pytorch_fwd_kv_input = torch.randn(
+            (seqlen, batch_size, num_heads, k_dim + v_dim), dtype=dtype, device='cuda'
+        )
+        pytorch_fwd_emb_input = torch.randn(
+            (seqlen, batch_size, 1, emb_dim), dtype=dtype, device='cuda'
+        )
+        pytorch_bwd_k_input = torch.randn(
+            (seqlen, batch_size, num_heads, k_dim + emb_dim), dtype=dtype, device='cuda'
+        )
+        pytorch_bwd_v_input = torch.randn(
+            (seqlen, batch_size, num_heads, v_dim), dtype=dtype, device='cuda'
+        )
+    else:
+        cu_seqlens = [0, 27, 54, 99, 128]
+        total_seqlen = cu_seqlens[-1]
+        max_seqlen = 0
+        for i in range(len(cu_seqlens) - 1):
+            max_seqlen = max(max_seqlen, cu_seqlens[i + 1] - cu_seqlens[i])
+        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device='cuda')
+        yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=max_seqlen)
+        freqs, mscale = yarn_rope(max_seqlen, 0)
+        cos = (torch.cos(freqs) * mscale).to(dtype)
+        sin = (torch.sin(freqs) * mscale).to(dtype)
+
+        pytorch_fwd_kv_input = torch.randn(
+            (total_seqlen, num_heads, k_dim + v_dim), dtype=dtype, device='cuda'
+        )
+        pytorch_fwd_emb_input = torch.randn((total_seqlen, 1, emb_dim), dtype=dtype, device='cuda')
+        pytorch_bwd_k_input = torch.randn(
+            (total_seqlen, num_heads, k_dim + emb_dim), dtype=dtype, device='cuda'
+        )
+        pytorch_bwd_v_input = torch.randn(
+            (total_seqlen, num_heads, v_dim), dtype=dtype, device='cuda'
+        )
+
+    pytorch_fwd_kv_input.requires_grad_(True)
+    pytorch_fwd_emb_input.requires_grad_(True)
+    fused_fwd_kv_input = pytorch_fwd_kv_input.detach()
+    fused_fwd_kv_input.requires_grad_(True)
+    fused_fwd_emb_input = pytorch_fwd_emb_input.detach()
+    fused_fwd_emb_input.requires_grad_(True)
+    fused_bwd_k_input = pytorch_bwd_k_input.detach()
+    fused_bwd_v_input = pytorch_bwd_v_input.detach()
+
+    pe_output = apply_rotary_pos_emb(
+        pytorch_fwd_emb_input,
+        freqs,
+        transformer_config,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
+        mscale=mscale,
+        cp_group=FakeCPGroup(),
+        mla_rotary_interleaved=True,
+        mla_output_remove_interleaving=remove_interleaving,
+    )
+    if input_format == "sbhd":
+        pe_output = pe_output.expand(-1, -1, num_heads, -1)
+    else:
+        pe_output = pe_output.expand(-1, num_heads, -1)
+    k, pytorch_v_output = torch.split(pytorch_fwd_kv_input, [k_dim, v_dim], dim=-1)
+    pytorch_k_output = torch.concat([k, pe_output], dim=-1)
+    torch.autograd.backward(
+        (pytorch_k_output, pytorch_v_output), (pytorch_bwd_k_input, pytorch_bwd_v_input)
+    )
+
+    fused_k_output, fused_v_output = fused_mla_rope_kv_split(
+        fused_fwd_kv_input,
+        fused_fwd_emb_input,
+        cos,
+        sin,
+        emb_dim,
+        k_dim,
+        v_dim,
+        cu_seqlens_kv=cu_seqlens,
+        remove_interleaving=remove_interleaving,
+    )
+    torch.autograd.backward(
+        (fused_k_output, fused_v_output), (fused_bwd_k_input, fused_bwd_v_input)
+    )
+
+    tols = dtype_tols(dtype)
+    torch.testing.assert_close(
+        pytorch_k_output.float(),
+        fused_k_output.float(),
+        msg=lambda msg: f"Mismatch in k fwd: {msg}",
+        **tols,
+    )
+    torch.testing.assert_close(
+        pytorch_v_output.float(),
+        fused_v_output.float(),
+        msg=lambda msg: f"Mismatch in v fwd: {msg}",
+        **tols,
+    )
+    torch.testing.assert_close(
+        pytorch_fwd_kv_input.grad.float(),
+        fused_fwd_kv_input.grad.float(),
+        msg=lambda msg: f"Mismatch in kv bwd: {msg}",
+        **tols,
+    )
+    torch.testing.assert_close(
+        pytorch_fwd_emb_input.grad.float(),
+        fused_fwd_emb_input.grad.float(),
+        msg=lambda msg: f"Mismatch in emb bwd: {msg}",
+        **tols,
+    )
+
+
+def _make_noncontiguous_leaf(values):
+    storage = torch.empty(
+        *values.shape[:-1], values.size(-1) * 2, dtype=values.dtype, device=values.device
+    )
+    result = storage[..., ::2]
+    result.copy_(values)
+    return result.detach().requires_grad_(True)
+
+
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("num_heads", [1, 64])
+@pytest.mark.parametrize("layout", ["sbhd", "thd", "thd_cp_padding"])
+def test_mla_rope_concat_matches_native(layout, num_heads, dtype):
+    """Fused packing must match an independent PyTorch RoPE + concat reference."""
+    assert fused_mla_rope_concat is not None
+    nope_dim = 512
+    emb_dim = 64
+    config = TransformerConfig(
+        num_attention_heads=num_heads,
+        num_layers=1,
+        rotary_interleaved=False,
+        multi_latent_attention=True,
+    )
+
+    if layout == "sbhd":
+        max_seqlen = 16
+        input_shape = (max_seqlen, 2, num_heads)
+        cu_seqlens = None
+        cp_size, cp_rank = 1, 0
+        valid_tokens = input_shape[0] * input_shape[1]
+    elif layout == "thd":
+        seqlens = [12, 20, 24]
+        max_seqlen = max(seqlens)
+        cu_seqlens = torch.tensor([0, 12, 32, 56], dtype=torch.int32, device="cuda")
+        input_shape = (56, num_heads)
+        cp_size, cp_rank = 1, 0
+        valid_tokens = input_shape[0]
+    else:
+        global_seqlens = [16, 24, 32]
+        max_seqlen = max(global_seqlens)
+        cu_seqlens = torch.tensor([0, 16, 40, 72], dtype=torch.int32, device="cuda")
+        cp_size, cp_rank = 2, 1
+        valid_tokens = sum(global_seqlens) // cp_size
+        input_shape = (valid_tokens + 4, num_heads)
+
+    rotary = RotaryEmbedding(emb_dim, rotary_percent=1.0, rotary_base=10000)
+    freqs = rotary(max_seqlen, packed_seq=cu_seqlens is not None)
+    cos = freqs.cos().to(device="cuda", dtype=dtype).contiguous()
+    sin = freqs.sin().to(device="cuda", dtype=dtype).contiguous()
+    nope_values = torch.randn(*input_shape, nope_dim, dtype=dtype, device="cuda")
+    rope_values = torch.randn(*input_shape, emb_dim, dtype=dtype, device="cuda")
+
+    native_nope = _make_noncontiguous_leaf(nope_values)
+    native_rope = _make_noncontiguous_leaf(rope_values)
+    fused_nope = _make_noncontiguous_leaf(nope_values)
+    fused_rope = _make_noncontiguous_leaf(rope_values)
+    assert not fused_nope.is_contiguous() and not fused_rope.is_contiguous()
+
+    rotated = apply_rotary_pos_emb(
+        native_rope,
+        freqs,
+        config,
+        cu_seqlens=cu_seqlens,
+        cp_group=FakeCPGroup(cp_size, cp_rank),
+        mla_rotary_interleaved=True,
+        max_seqlen=max_seqlen if cu_seqlens is not None else None,
+    )
+    native_output = torch.cat((native_nope, rotated), dim=-1)
+    fused_output = fused_mla_rope_concat(
+        fused_nope, fused_rope, cos, sin, cu_seqlens=cu_seqlens, cp_rank=cp_rank, cp_size=cp_size
+    )
+    assert fused_output.is_contiguous()
+
+    if layout == "sbhd":
+        valid_output = (slice(None),)
+    else:
+        valid_output = (slice(0, valid_tokens),)
+    tols = dtype_tols(dtype)
+    torch.testing.assert_close(
+        native_output[valid_output].float(), fused_output[valid_output].float(), **tols
+    )
+
+    grad = torch.randn_like(fused_output)
+    if layout != "sbhd" and valid_tokens < grad.size(0):
+        grad[valid_tokens:] = 0
+    native_output.backward(grad)
+    fused_output.backward(grad)
+    torch.testing.assert_close(native_nope.grad.float(), fused_nope.grad.float(), **tols)
+    torch.testing.assert_close(native_rope.grad.float(), fused_rope.grad.float(), **tols)
+
+
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("input_format", ["sbhd", "thd"])
+class TestFusedApplyMLARope:
+    @pytest.mark.flaky_in_dev
+    @pytest.mark.parametrize("rope_first", [False, True], ids=["nope-first", "rope-first"])
+    def test_forward_backward_for_q(self, input_format, rope_first):
+        _test_fused_mla_rope_inplace(input_format, rope_first=rope_first)
+
+    @pytest.mark.parametrize("remove_interleaving", [False, True])
+    def test_kv_split_forward_backward(self, input_format, remove_interleaving):
+        _test_fused_mla_rope_kv_split(input_format, remove_interleaving=remove_interleaving)
+
+
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("input_format", ["sbhd", "thd"])
+def test_out_of_place_inverse_rope_preserves_upstream_saved_output(input_format):
+    """Post-attention inverse RoPE must not overwrite an output saved for backward."""
+    assert fused_mla_rope_out_of_place is not None
+    seqlen = 32
+    batch_size = 1
+    num_heads = 2
+    nope_dim = 16
+    emb_dim = 64
+    dtype = torch.bfloat16
+
+    yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=seqlen)
+    freqs, mscale = yarn_rope(seqlen, 0)
+    cos = (torch.cos(freqs) * mscale).to(dtype)
+    sin = (torch.sin(freqs) * mscale).to(dtype)
+
+    if input_format == "sbhd":
+        shape = (seqlen, batch_size, num_heads, nope_dim + emb_dim)
+        cu_seqlens = None
+    else:
+        shape = (2 * seqlen, num_heads, nope_dim + emb_dim)
+        cu_seqlens = torch.tensor([0, seqlen, 2 * seqlen], dtype=torch.int32, device="cuda")
+
+    unsafe_source = torch.randn(shape, dtype=dtype, device="cuda", requires_grad=True)
+    unsafe_attention_output = _SaveOutputForBackward.apply(unsafe_source)
+    unsafe_reference = unsafe_attention_output.detach().clone()
+    unsafe_inverse_output = fused_mla_rope_inplace(
+        unsafe_attention_output,
+        cos,
+        sin,
+        nope_dim,
+        emb_dim,
+        cu_seqlens_q=cu_seqlens,
+        inverse=True,
+        remove_interleaving=True,
+    )
+
+    assert unsafe_inverse_output.data_ptr() == unsafe_attention_output.data_ptr()
+    assert not torch.equal(unsafe_attention_output, unsafe_reference)
+
+    source = torch.randn(shape, dtype=dtype, device="cuda", requires_grad=True)
+    attention_output = _SaveOutputForBackward.apply(source)
+    saved_reference = attention_output.detach().clone()
+
+    inverse_output = fused_mla_rope_out_of_place(
+        attention_output,
+        cos,
+        sin,
+        nope_dim,
+        emb_dim,
+        cu_seqlens_q=cu_seqlens,
+        inverse=True,
+        remove_interleaving=True,
+    )
+    expected_inverse_output = fused_mla_rope_inplace(
+        saved_reference.clone(),
+        cos,
+        sin,
+        nope_dim,
+        emb_dim,
+        cu_seqlens_q=cu_seqlens,
+        inverse=True,
+        remove_interleaving=True,
+    )
+
+    assert inverse_output.data_ptr() != attention_output.data_ptr()
+    torch.testing.assert_close(attention_output, saved_reference, rtol=0, atol=0)
+    torch.testing.assert_close(inverse_output, expected_inverse_output, rtol=0, atol=0)
+
+    inverse_output.backward(torch.randn_like(inverse_output).contiguous())
+    torch.testing.assert_close(source.grad, saved_reference, rtol=0, atol=0)
+
+
+class TestApplyRotaryPosEmbMlaFusionConflict:
+    """Test apply_rotary_pos_emb: mla_rotary_interleaved vs apply_rope_fusion conflict."""
+
+    def setup_method(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        self.seq_len = 16
+        self.num_heads = 2
+        self.kv_channels = 32
+        self.rot_dim = self.kv_channels
+
+    def teardown_method(self):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_mla_rotary_interleaved_with_apply_rope_fusion_emits_warning_and_uses_unfused(self):
+        """When apply_rope_fusion=True and mla_rotary_interleaved=True, expect warning and unfused path."""
+        config = TransformerConfig(
+            num_attention_heads=self.num_heads,
+            num_layers=1,
+            apply_rope_fusion=True,
+            rotary_interleaved=False,
+        )
+        t = torch.randn(
+            self.seq_len, 1, self.num_heads, self.kv_channels, device="cuda", dtype=torch.float32
+        )
+        freqs = torch.randn(self.seq_len, 1, 1, self.rot_dim, device="cuda", dtype=torch.float32)
+
+        fused_mock = MagicMock(return_value=t.clone())
+        with (
+            patch.object(rope_utils_module, "fused_apply_rotary_pos_emb", fused_mock),
+            patch.object(
+                rope_utils_module,
+                "_apply_rotary_pos_emb_bshd",
+                wraps=rope_utils_module._apply_rotary_pos_emb_bshd,
+            ) as unfused_spy,
+        ):
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                out = apply_rotary_pos_emb(t, freqs, config, mla_rotary_interleaved=True)
+            # Should have warned about MLA + fusion conflict
+            mla_fusion_warnings = [
+                x for x in w if "apply_rope_fusion does not support MLA-style" in str(x.message)
+            ]
+            assert (
+                len(mla_fusion_warnings) >= 1
+            ), "Expected warning when mla_rotary_interleaved and apply_rope_fusion both enabled"
+            # Fused kernel must not be used
+            fused_mock.assert_not_called()
+            # Unfused path must have been used
+            unfused_spy.assert_called_once()
+            call_kw = unfused_spy.call_args[1]
+            assert call_kw["mla_rotary_interleaved"] is True
+        assert out.shape == t.shape

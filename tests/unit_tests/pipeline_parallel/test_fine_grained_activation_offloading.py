@@ -1,0 +1,1843 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+import gc
+import os
+from contextlib import nullcontext
+from typing import Dict, List, Optional, Tuple
+
+import pytest
+import torch
+
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import ChunkOffloadHandler
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedOffloadingBackwardRecordFunction,
+    PipelineOffloadManager,
+)
+from megatron.core.tensor_parallel.random import (
+    CheckpointWithoutOutput,
+    is_checkpoint_without_output_tensor,
+    model_parallel_cuda_manual_seed,
+)
+from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
+from megatron.core.utils import is_te_min_version
+from tests.unit_tests.test_utilities import Utils
+
+# Tolerance for memory expectation check (GPU allocator jitter etc).
+EPSILON = 0.30
+EPSILON_A2A = 0.30
+DELTA = 20  # MiB
+CUDA_GRAPH_DELTA = 200  # MiB — Considering some CG overhead
+
+
+def _reset_cuda_memory() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+
+def _make_chunk_handler_for_offload_checker(min_offloaded_tensor_size: int = 1):
+    handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
+    handler.min_offloaded_tensor_size = min_offloaded_tensor_size
+    return handler
+
+
+def test_chunk_offload_handler_skips_non_offloadable_tensor_types():
+    handler = _make_chunk_handler_for_offload_checker()
+
+    cpu_tensor = torch.empty(1024)
+    assert not handler.tensor_need_offloading_checker(cpu_tensor)
+    assert handler.tensor_push(cpu_tensor) is cpu_tensor
+    assert handler.tensor_pop(cpu_tensor) is cpu_tensor
+
+    parameter = torch.nn.Parameter(torch.empty(1024))
+    assert not handler.tensor_need_offloading_checker(parameter)
+    assert handler.tensor_push(parameter) is parameter
+    assert handler.tensor_pop(parameter) is parameter
+
+    try:
+        from torch._subclasses.fake_tensor import FakeTensorMode
+    except ImportError:
+        pytest.skip("FakeTensorMode is not available in this PyTorch version.")
+
+    with FakeTensorMode():
+        fake_tensor = torch.empty(1024, device="cuda")
+    assert not handler.tensor_need_offloading_checker(fake_tensor)
+    assert handler.tensor_push(fake_tensor) is fake_tensor
+    assert handler.tensor_pop(fake_tensor) is fake_tensor
+
+
+def test_cuda_graph_backward_completion_callback_is_per_graph_task(monkeypatch):
+    """Each TE-style GraphTask queues its own sync-back event after AccumulateGrad."""
+    calls = []
+    active_task = None
+
+    class RecordingStream:
+        def record_event(self, event):
+            calls.append((active_task, "record_event", event))
+
+        def wait_stream(self, stream):
+            calls.append((active_task, "wait_stream", stream))
+
+    recording_stream = RecordingStream()
+
+    def current_stream():
+        calls.append((active_task, "callback_boundary", recording_stream))
+        return recording_stream
+
+    monkeypatch.setattr(torch.cuda, "current_stream", current_stream)
+
+    for task_name in ("first", "second"):
+        active_task = task_name
+        graph_event = object()
+        h2d_stream = object()
+        monkeypatch.setattr(
+            PipelineOffloadManager,
+            "OFFLOAD_MGR",
+            type("Manager", (), {"cuda_graph_event": graph_event, "h2d_stream": h2d_stream})(),
+        )
+
+        hidden_states = torch.tensor(2.0, requires_grad=True)
+        weight = torch.nn.Parameter(torch.tensor(3.0))
+        hidden_states.register_post_accumulate_grad_hook(
+            lambda _tensor, name=task_name, tensor=hidden_states: calls.append(
+                (name, "input_grad", tensor)
+            )
+        )
+        weight.register_post_accumulate_grad_hook(
+            lambda _param, name=task_name, param=weight: calls.append((name, "param_grad", param))
+        )
+
+        task_start = len(calls)
+        recorded_input = FineGrainedOffloadingBackwardRecordFunction.apply(hidden_states)
+        (recorded_input * weight).backward()
+        task_calls = calls[task_start:]
+
+        assert [call[0] for call in task_calls] == [task_name] * 5
+        assert {call[1] for call in task_calls[:2]} == {"input_grad", "param_grad"}
+        assert task_calls[2:] == [
+            (task_name, "callback_boundary", recording_stream),
+            (task_name, "record_event", graph_event),
+            (task_name, "wait_stream", h2d_stream),
+        ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+def test_chunk_offload_handler_respects_tensor_opt_out_flags():
+    handler = _make_chunk_handler_for_offload_checker()
+
+    tensor = torch.empty(1024, device="cuda")
+    assert handler.tensor_need_offloading_checker(tensor)
+
+    tensor._TE_do_not_offload = True
+    assert not handler.tensor_need_offloading_checker(tensor)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+def test_chunk_offload_handler_handles_storage_less_tensor_wrapper():
+    """TE-style wrapper tensors must reach their opt-out without requiring storage."""
+
+    data_tensor = torch.empty(1, device="cuda")
+    data_tensor._TE_do_not_offload = True
+
+    class StorageLessTensor(torch.Tensor):
+        """Minimal TE-style tensor wrapper without backing storage."""
+
+        @staticmethod
+        def __new__(cls):
+            return torch.Tensor._make_wrapper_subclass(
+                cls,
+                (1024,),
+                strides=(1,),
+                storage_offset=0,
+                dtype=torch.float32,
+                layout=torch.strided,
+                device="cuda",
+                requires_grad=False,
+            )
+
+        @classmethod
+        def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+            raise NotImplementedError
+
+        def get_data_tensors(self):
+            """Return the backing tensor inspected by TE's offload opt-out."""
+            return [data_tensor]
+
+        def untyped_storage(self):
+            raise RuntimeError("StorageLessTensor has no backing storage")
+
+    handler = _make_chunk_handler_for_offload_checker()
+    tensor = StorageLessTensor()
+
+    assert not handler.tensor_need_offloading_checker(tensor)
+    assert not is_checkpoint_without_output_tensor(tensor)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+def test_chunk_offload_handler_skips_checkpoint_without_output_storage():
+    """Checkpoint outputs and their views must not be copied or released by offload."""
+    handler = _make_chunk_handler_for_offload_checker()
+    Utils.initialize_model_parallel()
+    try:
+        input_tensor = torch.randn(8, device="cuda", requires_grad=True)
+        checkpoint = CheckpointWithoutOutput()
+        output = checkpoint.checkpoint(lambda tensor: tensor * 2, input_tensor)
+
+        assert not handler.tensor_need_offloading_checker(output)
+        assert not handler.tensor_need_offloading_checker(output.view(2, 4))
+        assert handler.tensor_need_offloading_checker(output.clone())
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def _build_gpt_model(
+    *,
+    seed: int,
+    num_layers: int,
+    hidden_size: int,
+    num_attention_heads: int,
+    vocab_size: int,
+    seq_length: int,
+    num_experts: Optional[int],
+    fine_grained_activation_offloading: bool,
+    offload_modules: Optional[List[str]],
+    min_offloaded_tensor_size: int,
+    is_mla: bool,
+    enable_hyper_connections: bool = False,
+    num_residual_streams: int = 4,
+    mhc_recompute_layer_num: Optional[int] = None,
+) -> GPTModel:
+    """Build a GPTModel that uses TE-based transformer layer spec."""
+    model_parallel_cuda_manual_seed(seed)
+    torch.manual_seed(seed)
+    ConfigClass = MLATransformerConfig if is_mla else TransformerConfig
+    recompute_modules = ["layernorm", "moe_act"] if num_experts is not None else ["layernorm"]
+    if enable_hyper_connections and mhc_recompute_layer_num is not None:
+        recompute_modules.append("mhc")
+    transformer_config = ConfigClass(
+        num_layers=num_layers,
+        hidden_size=hidden_size,
+        num_attention_heads=num_attention_heads,
+        use_cpu_initialization=True,
+        attention_backend=AttnBackend.unfused,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        # Recompute
+        recompute_modules=recompute_modules,
+        recompute_granularity="selective",
+        # MoE
+        num_moe_experts=num_experts,
+        moe_grouped_gemm=(num_experts is not None),
+        # Fine-grained activation offloading
+        fine_grained_activation_offloading=fine_grained_activation_offloading,
+        offload_modules=offload_modules,
+        min_offloaded_tensor_size=min_offloaded_tensor_size,
+        # Hyper Connection settings
+        enable_hyper_connections=enable_hyper_connections,
+        num_residual_streams=num_residual_streams,
+        mhc_recompute_layer_num=mhc_recompute_layer_num,
+    )
+    gpt_model = GPTModel(
+        config=transformer_config,
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
+            num_experts=num_experts,
+            moe_grouped_gemm=num_experts is not None,
+            multi_latent_attention=is_mla,
+            enable_hyper_connection=enable_hyper_connections,
+        ),
+        vocab_size=vocab_size,
+        max_sequence_length=seq_length,
+    ).bfloat16()
+    return gpt_model
+
+
+def _make_gpt_inputs(
+    *, seq_length: int, micro_batch_size: int, device: torch.device
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    data = list(range(seq_length))
+    input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(device)
+    position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(device)
+    attention_mask = torch.ones((micro_batch_size, 1, seq_length, seq_length), dtype=bool).to(
+        device
+    )
+    return input_ids, position_ids, attention_mask
+
+
+def _capture_params(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    params: Dict[str, torch.Tensor] = {}
+    for name, p in model.named_parameters():
+        params[name] = p.detach().cpu().clone()
+    return params
+
+
+def _restore_params(model: torch.nn.Module, params: Dict[str, torch.Tensor]) -> None:
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            p.copy_(params[name].to(device=p.device, dtype=p.dtype))
+
+
+def _run_one_iter_and_capture(
+    model: GPTModel,
+    *,
+    input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    enable_offload_reset: bool,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], int]:
+    """
+    Run a single forward+backward iteration.
+
+    Returns:
+      - logits (CPU float32)
+      - selected grads (CPU float32)
+      - peak_memory_allocated (bytes) during the iteration
+    """
+
+    if enable_offload_reset:
+        off_interface.reset()
+
+    # Keep warmup-created grad buffers resident so the peak-memory check still
+    # compares the steady-state allocator footprint, but remove accumulated
+    # warmup values before capturing correctness grads.
+    for p in model.parameters():
+        if p.grad is not None:
+            p.grad.zero_()
+
+    torch.cuda.reset_peak_memory_stats()
+    logits = model(input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask)
+    loss = logits.float().sum()
+    loss.backward()
+    torch.cuda.synchronize()
+    peak_bytes = int(torch.cuda.max_memory_allocated())
+
+    # capture all gradients for correctness
+    grads: Dict[str, torch.Tensor] = {}
+    for name, p in model.named_parameters():
+        grads[name] = p.grad.detach().float().cpu() if p.grad is not None else None
+
+    return logits.detach().float().cpu(), grads, peak_bytes
+
+
+def _build_one_layer_vpp_models(*, seed: int) -> List[GPTModel]:
+    """Build PP=2/VPP=2 GPT chunks with exactly one TransformerLayer per chunk."""
+    from megatron.core import parallel_state
+    from megatron.core.enums import ModelType
+
+    model_parallel_cuda_manual_seed(seed)
+    torch.manual_seed(seed)
+    config = TransformerConfig(
+        num_layers=4,
+        hidden_size=128,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
+        attention_backend=AttnBackend.unfused,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        pipeline_dtype=torch.bfloat16,
+        pipeline_model_parallel_size=2,
+        virtual_pipeline_model_parallel_size=2,
+        fine_grained_activation_offloading=True,
+        offload_modules=["core_attn", "attn_proj"],
+        min_offloaded_tensor_size=1,
+    )
+
+    models = []
+    for vp_stage in range(2):
+        model = (
+            GPTModel(
+                config=config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=128,
+                max_sequence_length=32,
+                pre_process=parallel_state.is_pipeline_first_stage(
+                    ignore_virtual=False, vp_stage=vp_stage
+                ),
+                post_process=parallel_state.is_pipeline_last_stage(
+                    ignore_virtual=False, vp_stage=vp_stage
+                ),
+                position_embedding_type="rope",
+                vp_stage=vp_stage,
+                share_embeddings_and_output_weights=False,
+            )
+            .bfloat16()
+            .cuda()
+        )
+        model.model_type = ModelType.encoder_or_decoder
+        model.train()
+        assert len(model.decoder.layers) == 1
+        models.append(model)
+    return models
+
+
+def _run_one_vpp_iteration(models: List[GPTModel]) -> List[Dict[str, torch.Tensor]]:
+    """Run one complete interleaved pipeline forward/backward iteration."""
+    from megatron.core.pipeline_parallel import get_forward_backward_func
+
+    seq_length = 32
+    micro_batch_size = 1
+    num_microbatches = 4
+
+    def forward_step_func(data_iterator, model):
+        next(data_iterator)
+        tokens = torch.arange(seq_length, dtype=torch.long, device="cuda").unsqueeze(0)
+        position_ids = torch.arange(seq_length, dtype=torch.long, device="cuda").unsqueeze(0)
+        labels = tokens.clone()
+        output = model(tokens, position_ids, None, labels=labels)
+
+        def loss_func(output_tensor):
+            loss = output_tensor.float().mean()
+            return loss, {"lm loss": loss.detach()}
+
+        return output, loss_func
+
+    losses = get_forward_backward_func()(
+        forward_step_func=forward_step_func,
+        data_iterator=[iter(range(num_microbatches)) for _ in models],
+        model=models,
+        num_microbatches=num_microbatches,
+        seq_length=seq_length,
+        micro_batch_size=micro_batch_size,
+        forward_only=False,
+    )
+    torch.cuda.synchronize()
+    return losses
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+def test_one_layer_vpp_chunk_runs_full_iteration_with_activation_offload():
+    """Do not advance a one-layer VPP chunk before its later offload group.
+
+    The warmup iteration records the real group layout for four TransformerLayers.
+    The second iteration executes the PP=2/VPP=2 interleaved 1F1B schedule, including
+    the immediate backward whose preceding virtual chunk contains only one layer.
+    """
+    from megatron.core import parallel_state
+
+    if Utils.world_size < 2 or Utils.world_size % 2 != 0:
+        pytest.skip("PP=2 requires an even WORLD_SIZE of at least 2.")
+
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=2,
+        virtual_pipeline_model_parallel_size=2,
+    )
+    off_interface.reset_instance()
+
+    try:
+        models = _build_one_layer_vpp_models(seed=123)
+
+        # Build the real cached ChunkOffloadHandlers, then run one steady-state iteration.
+        _run_one_vpp_iteration(models)
+        for model in models:
+            for param in model.parameters():
+                if param.grad is not None:
+                    param.grad.zero_()
+        losses = _run_one_vpp_iteration(models)
+
+        grads = [
+            param.grad for model in models for param in model.parameters() if param.grad is not None
+        ]
+        assert grads, "Expected the interleaved schedule to produce parameter gradients."
+        assert all(torch.isfinite(grad).all() for grad in grads)
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+            assert len(losses) == 4
+            assert all(torch.isfinite(item["lm loss"]) for item in losses)
+    finally:
+        off_interface.reset_instance()
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+@pytest.mark.parametrize(
+    "is_moe, is_mla, offload_modules",
+    [
+        # Dense GPT modules
+        (False, True, ["attn_norm"]),
+        (True, False, ["qkv_linear"]),
+        (True, False, ["core_attn"]),
+        # # attn_proj depends on core_attn (validated in TransformerConfig.__post_init__)
+        (True, True, ["core_attn", "attn_proj"]),
+        (True, False, ["mlp_norm"]),
+        (True, False, ["expert_fc1"]),
+        (True, False, ["moe_act"]),
+    ],
+)
+def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
+    is_moe: bool, is_mla: bool, offload_modules: List[str]
+):
+    """
+    Initialize a GPTModel and verify:
+    - forward output correctness under each offload_modules setting
+    - backward gradient correctness (subset)
+    - peak GPU memory is reduced roughly as expected (based on recorded offload bytes)
+    """
+    # setup distributed/model-parallel (same pattern as other UTs)
+    os.environ.pop("NVTE_FUSED_ATTN", None)
+    os.environ.pop("NVTE_FLASH_ATTN", None)
+    os.environ.pop("NVTE_UNFUSED_ATTN", None)
+    # os.environ["NVTE_FLASH_ATTN"] = "1"
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+
+    seed = 123
+    # Choose shapes large enough to make memory deltas stable but still fast.
+    num_experts = 4 if is_moe else None
+    num_layers = 8
+    hidden_size = 2048 if num_experts is None else 1024
+    num_attention_heads = 16 if hidden_size >= 2048 else 8
+    vocab_size = 1024
+    seq_length = 1024
+    micro_batch_size = 2
+    device = torch.device("cuda")
+
+    input_ids, position_ids, attention_mask = _make_gpt_inputs(
+        seq_length=seq_length, micro_batch_size=micro_batch_size, device=device
+    )
+
+    from megatron.core.pipeline_parallel import fine_grained_activation_offload as off
+
+    off_interface.reset_instance()
+
+    try:
+        # 1) Baseline run (no offloading)
+        _reset_cuda_memory()
+        base_model = _build_gpt_model(
+            seed=seed,
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            vocab_size=vocab_size,
+            seq_length=seq_length,
+            num_experts=num_experts,
+            fine_grained_activation_offloading=False,
+            offload_modules=None,
+            min_offloaded_tensor_size=1024 * 1024,
+            is_mla=is_mla,
+        ).cuda()
+        base_model.train()
+        base_params = _capture_params(base_model)
+
+        # Warmup baseline once for allocator stability
+        _run_one_iter_and_capture(
+            base_model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            enable_offload_reset=False,
+        )
+        _reset_cuda_memory()
+        base_logits, base_grads, base_peak = _run_one_iter_and_capture(
+            base_model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            enable_offload_reset=False,
+        )
+        # Free baseline model GPU memory before offload path
+        del base_model
+        _reset_cuda_memory()
+
+        # 2) Offload run (warmup to record bytes + steady-state measurement)
+        off_model = _build_gpt_model(
+            seed=seed,
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            vocab_size=vocab_size,
+            seq_length=seq_length,
+            num_experts=num_experts,
+            fine_grained_activation_offloading=True,
+            offload_modules=offload_modules,
+            min_offloaded_tensor_size=1024,  # force offloading for UT determinism
+            is_mla=is_mla,
+        ).cuda()
+        _restore_params(off_model, base_params)
+        off_model.train()
+
+        # Warmup 1 iter to populate cached chunks, then reset to finish warmup bookkeeping.
+        _run_one_iter_and_capture(
+            off_model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            enable_offload_reset=True,
+        )
+        # Reset once more to trigger post_warmup_callback and apply steady-state offload decisions.
+        off_interface.reset()
+
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            PipelineOffloadManager,
+        )
+
+        mgr = PipelineOffloadManager.get_instance()
+        expected_offload_bytes = int(
+            sum(mgr.offload_summary_bytes.get(k, 0) for k in offload_modules)
+        )
+        expected_offload_mib = expected_offload_bytes / (1024**2)
+
+        _reset_cuda_memory()
+        off_logits, off_grads, off_peak = _run_one_iter_and_capture(
+            off_model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            enable_offload_reset=True,
+        )
+        del off_model
+        _reset_cuda_memory()
+
+        # 3) Correctness checks (forward + selected grads)
+        assert torch.allclose(off_logits, base_logits, rtol=1e-3, atol=1e-3)
+        assert set(off_grads.keys()) == set(base_grads.keys())
+        for name, gb in base_grads.items():
+            go = off_grads[name]
+            if gb is None or go is None:
+                assert gb is None and go is None, f"Grad None mismatch for {name}"
+                continue
+            assert torch.allclose(go, gb, rtol=1e-3, atol=1e-3), f"Grad mismatch for {name}"
+
+        # 4) Memory checks (peak allocated over forward+backward)
+        saved_mib = (base_peak - off_peak) / (1024**2)
+        assert saved_mib > 0.0, (
+            f"Expected GPU peak memory reduction for offload_modules={offload_modules}, "
+            f"but got saved={saved_mib:.2f}MiB (base={base_peak/(1024**2):.2f}MiB, "
+            f"off={off_peak/(1024**2):.2f}MiB)"
+        )
+
+        # If expectation is large enough, enforce approximate match.
+        # For tiny expectations, allocator noise may dominate; we only require a positive reduction.
+        if expected_offload_mib >= 2.0:
+            rel_err = abs(saved_mib - expected_offload_mib) / max(expected_offload_mib, 1e-6)
+            abs_err = abs(saved_mib - expected_offload_mib)
+            assert rel_err <= EPSILON and abs_err <= DELTA, (
+                f"Memory saving mismatch for offload_modules={offload_modules}: "
+                f"saved={saved_mib:.2f}MiB expected~={expected_offload_mib:.2f}MiB "
+                f"(rel_err={rel_err:.2f}, abs_err={abs_err:.2f})"
+            )
+            print(
+                f"Rank {torch.distributed.get_rank()}: Saved {saved_mib:.2f}MiB, expected {expected_offload_mib:.2f}MiB"
+            )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.flaky_in_dev
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+@pytest.mark.skipif(
+    not is_te_min_version("1.9.0.dev0"),
+    reason="EP A2A overlap requires TE 1.9.0.dev0+ in this repo's tests.",
+)
+@pytest.mark.parametrize(
+    "dispatcher_backend, is_mla, offload_modules",
+    [
+        ("alltoall", True, ["attn_norm"]),
+        ("alltoall", True, ["core_attn"]),
+        ("alltoall", True, ["attn_norm", "core_attn", "attn_proj"]),
+        ("alltoall", True, ["mlp_norm"]),
+        ("alltoall", False, ["expert_fc1"]),
+        ("alltoall", False, ["moe_act"]),
+        (
+            "alltoall",
+            True,
+            ["attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act"],
+        ),
+        (
+            "alltoall",
+            False,
+            ["attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act"],
+        ),
+    ],
+)
+def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
+    dispatcher_backend: str, is_mla: bool, offload_modules: List[str]
+):
+    """
+    Compatibility test for:
+      - fine-grained activation offloading
+      - EP all-to-all overlap (overlap_moe_expert_parallel_comm)
+      - memory saving roughly matches expected offload bytes (when expectation is large enough)
+
+    The EP A2A overlap initialization pattern is aligned with
+    `tests/unit_tests/a2a_overlap/test_schedule_chunk_1f1b.py`.
+    """
+    from megatron.core.models.common.model_chunk_schedule_plan import (
+        TransformerModelChunkSchedulePlan,
+    )
+    from megatron.core.pipeline_parallel.utils import set_streams
+    from tests.unit_tests.a2a_overlap.utils import deterministic_mode
+
+    # EP overlap requires distributed initialization with EP groups.
+    ep_size = 4
+    if Utils.world_size % ep_size != 0:
+        pytest.skip(
+            f"Skipping: WORLD_SIZE={Utils.world_size} must be divisible by ep_size={ep_size}."
+        )
+
+    seed = 123
+    num_experts = 8  # must be divisible by ep_size
+    if num_experts % ep_size != 0:
+        pytest.skip(
+            f"Skipping: num_moe_experts={num_experts} must be divisible by ep_size={ep_size}."
+        )
+
+    # Small shapes to keep this compatibility test fast.
+    num_layers = 8
+    hidden_size = 1024
+    num_attention_heads = 16
+    vocab_size = 1024
+    seq_length = 1024
+    micro_batch_size = 2
+    device = torch.device("cuda")
+
+    from megatron.core.pipeline_parallel import fine_grained_activation_offload as off
+
+    def _make_schedule_inputs() -> Dict[str, torch.Tensor]:
+        data = list(range(seq_length))
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(device)
+        position_ids = (
+            torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(device)
+        )
+        attention_mask = torch.ones((micro_batch_size, 1, seq_length, seq_length), dtype=bool).to(
+            device
+        )
+        labels = input_ids.clone()
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "position_ids": position_ids,
+            "attention_mask": attention_mask,
+        }
+
+    def _capture_params(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+        params: Dict[str, torch.Tensor] = {}
+        for name, p in model.named_parameters():
+            params[name] = p.detach().clone()
+        return params
+
+    def _restore_params(model: torch.nn.Module, params: Dict[str, torch.Tensor]) -> None:
+        for name, p in model.named_parameters():
+            p.data.copy_(params[name])
+
+    def _build_overlap_moe_gpt(
+        *, enable_offload: bool, is_mla: bool, dispatcher_backend: str
+    ) -> GPTModel:
+        model_parallel_cuda_manual_seed(seed)
+        torch.manual_seed(seed)
+        ConfigClass = MLATransformerConfig if is_mla else TransformerConfig
+        transformer_config = ConfigClass(
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            use_cpu_initialization=True,
+            attention_backend=AttnBackend.unfused,
+            # Recompute
+            recompute_modules=["layernorm", "moe_act"],
+            recompute_granularity="selective",
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            # MoE + EP overlap
+            num_moe_experts=num_experts,
+            moe_grouped_gemm=True,
+            expert_model_parallel_size=ep_size,
+            moe_token_dispatcher_type="alltoall" if dispatcher_backend == "alltoall" else "flex",
+            moe_flex_dispatcher_backend=dispatcher_backend,
+            moe_router_dtype="fp32" if dispatcher_backend == "hybridep" else "fp64",
+            overlap_moe_expert_parallel_comm=True,
+            delay_wgrad_compute=True,
+            # Fine-grained activation offloading
+            fine_grained_activation_offloading=enable_offload,
+            offload_modules=offload_modules if enable_offload else None,
+            min_offloaded_tensor_size=1024,  # force offloading to exercise the code path
+        )
+        return (
+            GPTModel(
+                config=transformer_config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
+                    num_experts=num_experts, moe_grouped_gemm=True, multi_latent_attention=is_mla
+                ),
+                vocab_size=vocab_size,
+                max_sequence_length=seq_length,
+            )
+            .bfloat16()
+            .cuda()
+        )
+
+    def _run_schedule_1f1b_two_microbatches(
+        model: GPTModel, *, enable_offload_reset: bool
+    ) -> Tuple[List[torch.Tensor], Dict[str, torch.Tensor], int]:
+        """
+        Run a minimal 1F1B schedule (2 microbatches) using ModelChunkSchedulePlan.run().
+        This is the execution path that exercises EP A2A overlap scheduling.
+        """
+        if enable_offload_reset:
+            off_interface.reset()
+
+        data0 = _make_schedule_inputs()
+        data1 = _make_schedule_inputs()
+        plan0 = model.build_schedule_plan(**data0)
+
+        torch.cuda.reset_peak_memory_stats()
+        out0 = TransformerModelChunkSchedulePlan.run(plan0, None)
+        plan1 = model.build_schedule_plan(**data1)
+        out1 = TransformerModelChunkSchedulePlan.run(plan1, plan0, b_grad=torch.ones_like(out0))
+        TransformerModelChunkSchedulePlan.run(None, plan1, b_grad=torch.ones_like(out1))
+        torch.cuda.synchronize()
+        peak_bytes = int(torch.cuda.max_memory_allocated())
+
+        # capture outputs and grads
+        outputs = [out0.detach().float().cpu(), out1.detach().float().cpu()]
+        grads: Dict[str, torch.Tensor] = {}
+        for name, p in model.named_parameters():
+            grads[name] = p.grad.detach().float().cpu() if p.grad is not None else None
+        return outputs, grads, peak_bytes
+
+    # setup distributed/model-parallel
+    os.environ.pop("NVTE_FUSED_ATTN", None)
+    os.environ.pop("NVTE_FLASH_ATTN", None)
+    os.environ.pop("NVTE_UNFUSED_ATTN", None)
+
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        expert_model_parallel_size=ep_size,
+    )
+    set_streams()
+
+    off_interface.reset_instance()
+
+    try:
+        with deterministic_mode():
+            # Baseline: EP overlap on, offload off.
+            _reset_cuda_memory()
+            base_model = _build_overlap_moe_gpt(
+                enable_offload=False, is_mla=is_mla, dispatcher_backend=dispatcher_backend
+            )
+            base_model.train()
+            base_params = _capture_params(base_model)
+            # Warmup once for allocator stability / graph caching
+            _run_schedule_1f1b_two_microbatches(base_model, enable_offload_reset=False)
+            _reset_cuda_memory()
+            base_outs, base_grads, base_peak = _run_schedule_1f1b_two_microbatches(
+                base_model, enable_offload_reset=False
+            )
+            del base_model
+            _reset_cuda_memory()
+
+            # Offload: EP overlap on, fine-grained offload on.
+            off_model = _build_overlap_moe_gpt(
+                enable_offload=True, is_mla=is_mla, dispatcher_backend=dispatcher_backend
+            )
+            _restore_params(off_model, base_params)
+            off_model.train()
+            # Warmup once to populate cached chunks, then reset to apply steady-state offload decisions.
+            off_interface.reset()
+            _run_schedule_1f1b_two_microbatches(off_model, enable_offload_reset=False)
+            off_interface.reset()
+            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                PipelineOffloadManager,
+            )
+
+            mgr = PipelineOffloadManager.get_instance()
+            expected_offload_bytes = int(
+                sum(mgr.offload_summary_bytes.get(k, 0) for k in offload_modules)
+            )
+            expected_offload_mib = expected_offload_bytes / (1024**2)
+
+            _reset_cuda_memory()
+            off_outs, off_grads, off_peak = _run_schedule_1f1b_two_microbatches(
+                off_model, enable_offload_reset=True
+            )
+            del off_model
+            _reset_cuda_memory()
+
+            # Correctness (forward outputs + all grads)
+            assert len(off_outs) == len(base_outs) == 2
+            for i in range(2):
+                assert torch.allclose(off_outs[i], base_outs[i], rtol=1e-3, atol=1e-3)
+            assert set(off_grads.keys()) == set(base_grads.keys())
+            for name, gb in base_grads.items():
+                go = off_grads[name]
+                if gb is None or go is None:
+                    assert gb is None and go is None, f"Grad None mismatch for {name}"
+                    continue
+                assert torch.allclose(
+                    go, gb, rtol=1e-3, atol=1e-3
+                ), f"Rank {torch.distributed.get_rank()}: Grad mismatch for {name}"
+
+            # Memory checks (peak allocated during the scheduled 1F1B run)
+            saved_mib = (base_peak - off_peak) / (1024**2)
+            assert saved_mib > 0.0, (
+                f"Expected GPU peak memory reduction for offload_modules={offload_modules}, "
+                f"but got saved={saved_mib:.2f}MiB (base={base_peak/(1024**2):.2f}MiB, "
+                f"off={off_peak/(1024**2):.2f}MiB)"
+            )
+            # If expectation is large enough, enforce approximate match.
+            if expected_offload_mib >= 2.0:
+                rel_err = abs(saved_mib - expected_offload_mib) / max(expected_offload_mib, 1e-6)
+                abs_err = abs(saved_mib - expected_offload_mib)
+                print(
+                    f"Rank {torch.distributed.get_rank()}: Saved {saved_mib:.2f}MiB, expected {expected_offload_mib:.2f}MiB"
+                )
+                if abs_err > DELTA:
+                    assert rel_err <= EPSILON_A2A, (
+                        f"Memory saving mismatch for offload_modules={offload_modules}: "
+                        f"saved={saved_mib:.2f}MiB expected~={expected_offload_mib:.2f}MiB "
+                        f"(rel_err={rel_err:.2f}, abs_err={abs_err:.2f})"
+                    )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+# =============================================================================
+# CUDA Graph + Fine-grained Activation Offloading Tests
+# =============================================================================
+
+
+def _build_gpt_model_with_cuda_graph(
+    *,
+    seed: int,
+    num_layers: int,
+    hidden_size: int,
+    num_attention_heads: int,
+    vocab_size: int,
+    seq_length: int,
+    num_experts: Optional[int],
+    fine_grained_activation_offloading: bool,
+    offload_modules: Optional[List[str]],
+    min_offloaded_tensor_size: int,
+    is_mla: bool,
+    cuda_graph_impl: str,
+    cuda_graph_modules: Optional[List[str]],
+    cuda_graph_warmup_steps: int,
+    delay_offload_until_cuda_graph: bool = False,
+    activation_offload_fraction: float = 1.0,
+    enable_hyper_connections: bool = False,
+    num_residual_streams: int = 4,
+) -> GPTModel:
+    """Build a GPTModel with CUDA Graph support and fine-grained activation offloading."""
+    model_parallel_cuda_manual_seed(seed)
+    torch.manual_seed(seed)
+    ConfigClass = MLATransformerConfig if is_mla else TransformerConfig
+    recompute_modules = ["layernorm", "moe_act"] if num_experts is not None else ["layernorm"]
+    transformer_config = ConfigClass(
+        num_layers=num_layers,
+        hidden_size=hidden_size,
+        num_attention_heads=num_attention_heads,
+        use_cpu_initialization=True,
+        attention_backend=AttnBackend.unfused,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        # Recompute (note: "mhc" recompute is incompatible with offloading)
+        recompute_modules=recompute_modules,
+        recompute_granularity="selective",
+        # MoE
+        num_moe_experts=num_experts,
+        moe_grouped_gemm=(num_experts is not None),
+        # Fine-grained activation offloading
+        fine_grained_activation_offloading=fine_grained_activation_offloading,
+        offload_modules=offload_modules,
+        min_offloaded_tensor_size=min_offloaded_tensor_size,
+        delay_offload_until_cuda_graph=delay_offload_until_cuda_graph,
+        activation_offload_fraction=activation_offload_fraction,
+        # CUDA Graph settings
+        cuda_graph_impl=cuda_graph_impl,
+        cuda_graph_modules=cuda_graph_modules,
+        cuda_graph_warmup_steps=cuda_graph_warmup_steps,
+        use_te_rng_tracker=True,
+        # Hyper Connection settings
+        enable_hyper_connections=enable_hyper_connections,
+        num_residual_streams=num_residual_streams,
+    )
+    gpt_model = GPTModel(
+        config=transformer_config,
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
+            num_experts=num_experts,
+            moe_grouped_gemm=num_experts is not None,
+            multi_latent_attention=is_mla,
+            enable_hyper_connection=enable_hyper_connections,
+        ),
+        vocab_size=vocab_size,
+        max_sequence_length=seq_length,
+    ).bfloat16()
+    return gpt_model
+
+
+def _run_iters_with_cuda_graph(
+    model: GPTModel,
+    *,
+    input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    num_warmup_iters: int,
+    num_measure_iters: int,
+    enable_offload_reset: bool,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], int]:
+    """
+    Run multiple forward+backward iterations with CUDA graph capture.
+
+    Returns:
+      - logits from last iteration (CPU float32)
+      - selected grads from last iteration (CPU float32)
+      - peak_memory_allocated (bytes) during measurement iterations
+    """
+    from megatron.core.num_microbatches_calculator import (
+        destroy_num_microbatches_calculator,
+        init_num_microbatches_calculator,
+    )
+    from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+    # Switch to a non-default stream so AccumulateGrad nodes (created during warmup backward
+    # passes) are associated with this stream rather than the default stream.  If they are on
+    # the default stream, CUDA graph capture will fail with cudaErrorStreamCaptureImplicit.
+    te_side_stream = torch.cuda.Stream()
+    te_side_stream.wait_stream(torch.cuda.current_stream())
+    torch.cuda.set_stream(te_side_stream)
+
+    micro_batch_size = input_ids.shape[0]
+    init_num_microbatches_calculator(
+        rank=0,
+        rampup_batch_size=None,
+        global_batch_size=micro_batch_size,
+        micro_batch_size=micro_batch_size,
+        data_parallel_size=1,
+        decrease_batch_size_if_needed=False,
+    )
+
+    if enable_offload_reset:
+        off_interface.reset()
+
+    # Warmup iterations (before CUDA graph capture)
+    for _ in range(num_warmup_iters):
+        if enable_offload_reset:
+            off_interface.reset()
+        logits = model(
+            input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
+        )
+        loss = logits.float().sum()
+        loss.backward()
+        # Zero grads for next iteration
+        for p in model.parameters():
+            if p.grad is not None:
+                p.grad.zero_()
+
+    # Trigger post-warmup offload decisions
+    if enable_offload_reset:
+        off_interface.reset()
+
+    # TECudaGraphHelper expects model chunks to have zero_grad_buffer() (from DDP wrappers).
+    # For a plain GPTModel, this is a no-op (same as the DataParallelBase base implementation).
+    if not hasattr(model, 'zero_grad_buffer'):
+        model.zero_grad_buffer = lambda: None
+
+    # Create CUDA graphs after warmup
+    cuda_graph_helper = TECudaGraphHelper(
+        model=[model],
+        config=model.config,
+        seq_length=input_ids.shape[1],
+        micro_batch_size=input_ids.shape[0],
+        optimizers=[],
+    )
+    cuda_graph_helper.create_cudagraphs()
+
+    # Measurement iterations (with CUDA graph replay)
+    torch.cuda.reset_peak_memory_stats()
+    for i in range(num_measure_iters):
+        if enable_offload_reset:
+            off_interface.reset()
+        logits = model(
+            input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
+        )
+        loss = logits.float().sum()
+        loss.backward()
+        if i < num_measure_iters - 1:
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad.zero_()
+
+    torch.cuda.synchronize()
+    peak_bytes = int(torch.cuda.max_memory_allocated())
+
+    # Capture grads from last iteration
+    grads: Dict[str, torch.Tensor] = {}
+    for name, p in model.named_parameters():
+        grads[name] = p.grad.detach().float().cpu() if p.grad is not None else None
+
+    # Cleanup CUDA graphs
+    if cuda_graph_helper.graphs_created():
+        cuda_graph_helper.delete_cuda_graphs()
+
+    destroy_num_microbatches_calculator()
+
+    return logits.detach().float().cpu(), grads, peak_bytes
+
+
+def _build_partial_cg_pipeline_model(
+    *, seed: int, num_layers: int, moe_layer_freq, offload_modules: List[str]
+) -> GPTModel:
+    """Build one PP=2 model chunk with graph-scoped attention and eager experts."""
+    from megatron.core import parallel_state
+    from megatron.core.enums import ModelType
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
+
+    model_parallel_cuda_manual_seed(seed)
+    torch.manual_seed(seed)
+    config = TransformerConfig(
+        num_layers=num_layers,
+        hidden_size=256,
+        num_attention_heads=8,
+        use_cpu_initialization=True,
+        attention_backend=AttnBackend.unfused,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        pipeline_dtype=torch.bfloat16,
+        pipeline_model_parallel_size=2,
+        recompute_modules=["layernorm", "moe_act"],
+        recompute_granularity="selective",
+        num_moe_experts=4,
+        moe_grouped_gemm=True,
+        moe_layer_freq=moe_layer_freq,
+        fine_grained_activation_offloading=True,
+        offload_modules=offload_modules,
+        min_offloaded_tensor_size=1,
+        delay_offload_until_cuda_graph=False,
+        cuda_graph_impl="transformer_engine",
+        cuda_graph_modules=["attn", "moe_router"],
+        cuda_graph_warmup_steps=3,
+        use_te_rng_tracker=True,
+    )
+    model = (
+        GPTModel(
+            config=config,
+            transformer_layer_spec=get_gpt_decoder_block_spec(
+                config=config, use_transformer_engine=True
+            ),
+            vocab_size=128,
+            max_sequence_length=128,
+            pre_process=parallel_state.is_pipeline_first_stage(),
+            post_process=parallel_state.is_pipeline_last_stage(),
+            position_embedding_type="rope",
+            share_embeddings_and_output_weights=False,
+        )
+        .bfloat16()
+        .cuda()
+    )
+    model.model_type = ModelType.encoder_or_decoder
+    model.train()
+    model.zero_grad_buffer = lambda: None
+    return model
+
+
+def _run_partial_cg_pipeline_iteration(model: GPTModel) -> List[Dict[str, torch.Tensor]]:
+    """Run one PP=2 pipeline iteration with four live CUDA-graph microbatch slots."""
+    from megatron.core.pipeline_parallel import get_forward_backward_func
+
+    seq_length = 128
+    micro_batch_size = 1
+    num_microbatches = 4
+
+    def forward_step_func(data_iterator, model):
+        microbatch_id = next(data_iterator)
+        tokens = (
+            (torch.arange(seq_length, dtype=torch.long, device="cuda") + microbatch_id)
+            .remainder(128)
+            .unsqueeze(0)
+        )
+        position_ids = torch.arange(seq_length, dtype=torch.long, device="cuda").unsqueeze(0)
+        output = model(tokens, position_ids, None, labels=tokens.clone())
+
+        def loss_func(output_tensor):
+            loss = output_tensor.float().mean()
+            return loss, {"lm loss": loss.detach()}
+
+        return output, loss_func
+
+    return get_forward_backward_func()(
+        forward_step_func=forward_step_func,
+        data_iterator=[iter(range(num_microbatches))],
+        model=[model],
+        num_microbatches=num_microbatches,
+        seq_length=seq_length,
+        micro_batch_size=micro_batch_size,
+        forward_only=False,
+    )
+
+
+def _run_partial_cg_offload_case(
+    *, num_layers: int, moe_layer_freq, offload_modules: List[str]
+) -> None:
+    """Validate one real PP=2 partial-CG/offload configuration."""
+    from megatron.core import parallel_state
+    from megatron.core.num_microbatches_calculator import (
+        destroy_num_microbatches_calculator,
+        init_num_microbatches_calculator,
+    )
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        PipelineOffloadManager,
+    )
+    from megatron.core.tensor_parallel.random import initialize_rng_tracker
+    from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+    from megatron.core.transformer.enums import CudaGraphModule
+    from megatron.core.transformer.moe.moe_layer import MoELayer
+
+    os.environ.pop("NVTE_FUSED_ATTN", None)
+    os.environ.pop("NVTE_FLASH_ATTN", None)
+    os.environ.pop("NVTE_UNFUSED_ATTN", None)
+
+    initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=2)
+    off_interface.reset_instance()
+    destroy_num_microbatches_calculator()
+    data_parallel_size = parallel_state.get_data_parallel_world_size()
+    init_num_microbatches_calculator(
+        rank=torch.distributed.get_rank(),
+        rampup_batch_size=None,
+        global_batch_size=4 * data_parallel_size,
+        micro_batch_size=1,
+        data_parallel_size=data_parallel_size,
+        decrease_batch_size_if_needed=False,
+    )
+    original_cuda_stream = torch.cuda.current_stream()
+    te_side_stream = torch.cuda.Stream()
+    te_side_stream.wait_stream(original_cuda_stream)
+    torch.cuda.set_stream(te_side_stream)
+
+    try:
+        model = _build_partial_cg_pipeline_model(
+            seed=123,
+            num_layers=num_layers,
+            moe_layer_freq=moe_layer_freq,
+            offload_modules=offload_modules,
+        )
+        local_num_layers = num_layers // 2
+        assert len(model.decoder.layers) == local_num_layers
+
+        if isinstance(moe_layer_freq, int):
+            global_moe_pattern = [
+                1 if layer_idx % moe_layer_freq == 0 else 0 for layer_idx in range(num_layers)
+            ]
+        else:
+            global_moe_pattern = moe_layer_freq
+        local_layer_offset = parallel_state.get_pipeline_model_parallel_rank() * local_num_layers
+        expected_local_moe_pattern = global_moe_pattern[
+            local_layer_offset : local_layer_offset + local_num_layers
+        ]
+        actual_local_moe_pattern = [
+            int(isinstance(layer.mlp, MoELayer)) for layer in model.decoder.layers
+        ]
+        assert actual_local_moe_pattern == expected_local_moe_pattern
+
+        assert model.config.cuda_graph_modules == [CudaGraphModule.attn, CudaGraphModule.moe_router]
+        attention_offload_modules = {"qkv_linear", "core_attn", "attn_proj"}
+        expected_offload_in_graph = bool(attention_offload_modules & set(offload_modules))
+        assert all(
+            layer.offload_module_in_cuda_graph == expected_offload_in_graph
+            for layer in model.decoder.layers
+        )
+        cuda_graph_helper = TECudaGraphHelper(
+            model=[model], config=model.config, seq_length=128, micro_batch_size=1, optimizers=[]
+        )
+
+        # Record real handlers and stabilize grad buffers before graph capture.
+        for _ in range(3):
+            for param in model.parameters():
+                if param.grad is not None:
+                    param.grad.zero_()
+            eager_losses = _run_partial_cg_pipeline_iteration(model)
+
+        eager_grads = {
+            name: param.grad.detach().float().cpu().clone()
+            for name, param in model.named_parameters()
+            if param.grad is not None
+        }
+        eager_loss_values = [item["lm loss"].float().cpu() for item in eager_losses]
+        offload_summary = PipelineOffloadManager.get_instance().offload_summary_bytes
+        for offload_module in offload_modules:
+            global_offload_bytes = torch.tensor(
+                offload_summary.get(offload_module, 0), dtype=torch.int64, device="cuda"
+            )
+            torch.distributed.all_reduce(global_offload_bytes)
+            assert global_offload_bytes.item() > 0, offload_summary
+
+        cuda_graph_helper.create_cudagraphs()
+        assert cuda_graph_helper.num_microbatches == 4
+        assert cuda_graph_helper.graphs_created()
+
+        for param in model.parameters():
+            if param.grad is not None:
+                param.grad.zero_()
+        losses = _run_partial_cg_pipeline_iteration(model)
+        torch.cuda.synchronize()
+
+        graph_grads = {
+            name: param.grad.detach().float().cpu()
+            for name, param in model.named_parameters()
+            if param.grad is not None
+        }
+        assert graph_grads.keys() == eager_grads.keys()
+        for name, eager_grad in eager_grads.items():
+            assert torch.allclose(graph_grads[name], eager_grad, rtol=1e-2, atol=1e-2), name
+        if parallel_state.is_pipeline_last_stage():
+            assert len(losses) == 4
+            graph_loss_values = [item["lm loss"].float().cpu() for item in losses]
+            assert all(
+                torch.allclose(graph_loss, eager_loss, rtol=1e-2, atol=1e-2)
+                for graph_loss, eager_loss in zip(graph_loss_values, eager_loss_values)
+            )
+    finally:
+        if "cuda_graph_helper" in locals() and cuda_graph_helper.graphs_created():
+            cuda_graph_helper.delete_cuda_graphs()
+        original_cuda_stream.wait_stream(te_side_stream)
+        torch.cuda.set_stream(original_cuda_stream)
+        destroy_num_microbatches_calculator()
+        off_interface.reset_instance()
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+@pytest.mark.skipif(
+    not is_te_min_version("2.14.0"), reason="Partial CUDA graph offloading requires TE >= 2.14.0"
+)
+def test_partial_cuda_graph_mixed_scope_offload_runs_full_iteration():
+    """Run graph-scoped core_attn and eager moe_act offload in one real iteration."""
+    _run_partial_cg_offload_case(
+        num_layers=4, moe_layer_freq=1, offload_modules=["core_attn", "moe_act"]
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+@pytest.mark.skipif(
+    not is_te_min_version("2.14.0"), reason="Partial CUDA graph offloading requires TE >= 2.14.0"
+)
+@pytest.mark.parametrize(
+    "offload_modules",
+    [
+        pytest.param(["moe_act"], id="moe-act-only"),
+        pytest.param(["expert_fc1", "moe_act"], id="moe-stack"),
+        pytest.param(["core_attn"], id="attention-core-only"),
+        pytest.param(["qkv_linear", "core_attn", "attn_proj"], id="attention-stack"),
+        pytest.param(["core_attn", "moe_act"], id="attention-and-moe-act"),
+        pytest.param(
+            ["qkv_linear", "core_attn", "attn_proj", "expert_fc1", "moe_act"],
+            id="attention-and-moe-stack",
+        ),
+    ],
+)
+def test_hybrid_dense_moe_partial_cuda_graph_offload_variants(offload_modules: List[str]):
+    """Exercise DeepSeek-V3-like dense-to-MoE layers across offload group subsets."""
+    _run_partial_cg_offload_case(
+        num_layers=6, moe_layer_freq=[0, 0, 1, 1, 1, 1], offload_modules=offload_modules
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+@pytest.mark.skipif(
+    not is_te_min_version("2.14.0"), reason="CUDA Graph with TE RNG tracker requires TE >= 2.13.0"
+)
+@pytest.mark.flaky_in_dev
+@pytest.mark.parametrize(
+    "is_mla, offload_modules, cuda_graph_modules, activation_offload_fraction, delay_offload",
+    [
+        # MoE model with attention CUDA graph + attn offloading
+        (False, ["core_attn", "attn_proj"], ["attn", "moe_router"], 1.0, True),
+        (False, ["expert_fc1", "moe_act"], ["attn", "moe_router", "moe_preprocess"], 1.0, True),
+        (False, ["core_attn", "attn_proj", "expert_fc1"], ["attn", "moe_router"], 1.0, True),
+        (
+            False,
+            ["core_attn", "attn_proj", "expert_fc1", "moe_act"],
+            ["attn", "moe_router"],
+            1.0,
+            True,
+        ),
+        (
+            False,
+            ["core_attn", "expert_fc1", "moe_act"],
+            ["attn", "moe_router", "moe_preprocess"],
+            1.0,
+            True,
+        ),
+        (
+            True,
+            ["core_attn", "attn_proj", "expert_fc1", "moe_act"],
+            ["attn", "moe_router", "moe_preprocess"],
+            1.0,
+            True,
+        ),
+        # Test activation_offload_fraction parameter
+        (False, ["core_attn", "attn_proj", "expert_fc1"], ["attn", "moe_router"], 0.0, True),
+        (False, ["core_attn", "attn_proj", "expert_fc1"], ["attn", "moe_router"], 0.5, True),
+        # Test delay_offload_until_cuda_graph parameter
+        (False, ["core_attn", "attn_proj", "expert_fc1"], ["attn", "moe_router"], 1.0, False),
+    ],
+)
+def test_fine_grained_activation_offloading_with_cuda_graph(
+    is_mla: bool,
+    offload_modules: List[str],
+    cuda_graph_modules: List[str],
+    activation_offload_fraction: float,
+    delay_offload: bool,
+):
+    """
+    Test fine-grained activation offloading combined with CUDA graph capture.
+
+    Verifies:
+    - Forward output correctness with CUDA graph + offloading
+    - Backward gradient correctness
+    - Memory savings from offloading are preserved with CUDA graphs
+    - Different activation_offload_fraction values work correctly
+    - Both delay_offload_until_cuda_graph=True/False produce correct results
+    """
+    from megatron.core.tensor_parallel.random import initialize_rng_tracker
+
+    os.environ.pop("NVTE_FUSED_ATTN", None)
+    os.environ.pop("NVTE_FLASH_ATTN", None)
+    os.environ.pop("NVTE_UNFUSED_ATTN", None)
+
+    initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+
+    seed = 123
+    num_experts = 4  # Always MoE model
+    num_layers = 4  # Smaller for faster test with CUDA graphs
+    hidden_size = 1024
+    num_attention_heads = 8
+    vocab_size = 512
+    seq_length = 512
+    micro_batch_size = 2
+    device = torch.device("cuda")
+    cuda_graph_warmup_steps = 3
+
+    input_ids, position_ids, attention_mask = _make_gpt_inputs(
+        seq_length=seq_length, micro_batch_size=micro_batch_size, device=device
+    )
+
+    off_interface.reset_instance()
+
+    try:
+        # 1) Baseline: CUDA graph enabled, offloading disabled
+        _reset_cuda_memory()
+        base_model = _build_gpt_model_with_cuda_graph(
+            seed=seed,
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            vocab_size=vocab_size,
+            seq_length=seq_length,
+            num_experts=num_experts,
+            fine_grained_activation_offloading=False,
+            offload_modules=None,
+            min_offloaded_tensor_size=1024 * 1024,
+            is_mla=is_mla,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=cuda_graph_modules,
+            cuda_graph_warmup_steps=cuda_graph_warmup_steps,
+        ).cuda()
+        base_model.train()
+
+        base_logits, base_grads, base_peak = _run_iters_with_cuda_graph(
+            base_model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            num_warmup_iters=cuda_graph_warmup_steps,
+            num_measure_iters=2,
+            enable_offload_reset=False,
+        )
+        del base_model
+        _reset_cuda_memory()
+
+        # 2) Test: CUDA graph enabled + offloading enabled
+        off_interface.reset_instance()
+
+        off_model = _build_gpt_model_with_cuda_graph(
+            seed=seed,
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            vocab_size=vocab_size,
+            seq_length=seq_length,
+            num_experts=num_experts,
+            fine_grained_activation_offloading=True,
+            offload_modules=offload_modules,
+            min_offloaded_tensor_size=1024,  # Force offloading for determinism
+            is_mla=is_mla,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=cuda_graph_modules,
+            cuda_graph_warmup_steps=cuda_graph_warmup_steps,
+            delay_offload_until_cuda_graph=delay_offload,
+            activation_offload_fraction=activation_offload_fraction,
+        ).cuda()
+        off_model.train()
+
+        off_logits, off_grads, off_peak = _run_iters_with_cuda_graph(
+            off_model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            num_warmup_iters=cuda_graph_warmup_steps,
+            num_measure_iters=2,
+            enable_offload_reset=True,
+        )
+        del off_model
+        _reset_cuda_memory()
+
+        # 3) Correctness checks
+        assert torch.allclose(
+            off_logits, base_logits, rtol=1e-2, atol=1e-2
+        ), f"Logits mismatch: max_diff={torch.max(torch.abs(off_logits - base_logits))}"
+        assert set(off_grads.keys()) == set(base_grads.keys())
+        for name, gb in base_grads.items():
+            go = off_grads[name]
+            if gb is None or go is None:
+                assert gb is None and go is None, f"Grad None mismatch for {name}"
+                continue
+            assert torch.allclose(
+                go, gb, rtol=1e-2, atol=1e-2
+            ), f"Grad mismatch for {name}: max_diff={torch.max(torch.abs(go - gb))}"
+
+        # 4) Memory checks - offloading should still reduce memory with CUDA graphs
+        saved_mib = (base_peak - off_peak) / (1024**2)
+        print(
+            f"CUDA Graph + Offload test (fraction={activation_offload_fraction}, delay={delay_offload}): "
+            f"base_peak={base_peak/(1024**2):.2f}MiB, "
+            f"off_peak={off_peak/(1024**2):.2f}MiB, "
+            f"saved={saved_mib:.2f}MiB"
+        )
+
+        # Basic sanity checks
+        assert not torch.isnan(off_logits).any(), "NaN detected in logits"
+        assert not torch.isinf(off_logits).any(), "Inf detected in logits"
+
+        # Check gradients are valid
+        for name, g in off_grads.items():
+            if g is not None:
+                assert not torch.isnan(g).any(), f"NaN detected in grad for {name}"
+                assert not torch.isinf(g).any(), f"Inf detected in grad for {name}"
+
+        # Note: With CUDA graphs, memory behavior may differ from eager mode.
+        # We check that offloading doesn't significantly increase memory.
+        # In some cases, graph capture overhead may offset offload savings.
+        assert saved_mib >= -CUDA_GRAPH_DELTA, (
+            f"Offloading with CUDA graph significantly increased memory: "
+            f"saved={saved_mib:.2f}MiB (negative means increase)"
+        )
+
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.flaky_in_dev
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+@pytest.mark.skipif(
+    not is_te_min_version("2.14.0"), reason="CUDA Graph with TE RNG tracker requires TE >= 2.13.0"
+)
+@pytest.mark.parametrize(
+    "offload_modules, cuda_graph_modules, delay_offload",
+    [
+        # mHC + MoE with attention CUDA graph + attn offloading
+        (["core_attn", "attn_proj"], ["attn", "moe_router"], True),
+        # mHC + MoE with expert offloading
+        (["expert_fc1", "moe_act"], ["attn", "moe_router", "moe_preprocess"], True),
+        # mHC + MoE with combined offloading
+        (["core_attn", "attn_proj", "expert_fc1", "moe_act"], ["attn", "moe_router"], True),
+        # mHC + delay_offload_until_cuda_graph=False
+        (["core_attn", "attn_proj", "expert_fc1"], ["attn", "moe_router"], False),
+    ],
+)
+def test_mhc_fine_grained_activation_offloading_with_cuda_graph(
+    offload_modules: List[str], cuda_graph_modules: List[str], delay_offload: bool
+):
+    """
+    Test mHC (Hyper Connection) + fine-grained activation offloading + CUDA graph.
+
+    This validates that the fix to HyperConnectionTransformerLayer._te_cuda_graph_replay_impl
+    correctly preserves the delay_offload_until_cuda_graph lifecycle (enter_replay /
+    flush_delayed_groups / exit_replay) from the parent class.
+
+    Note: "mhc" recompute is incompatible with fine_grained_activation_offloading,
+    so mhc recompute is NOT enabled here. HC still functions, just without the mHC-specific
+    selective recompute optimization.
+    """
+    from megatron.core.tensor_parallel.random import initialize_rng_tracker
+
+    os.environ.pop("NVTE_FUSED_ATTN", None)
+    os.environ.pop("NVTE_FLASH_ATTN", None)
+    os.environ.pop("NVTE_UNFUSED_ATTN", None)
+
+    initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+
+    seed = 123
+    num_experts = 4
+    num_layers = 4
+    hidden_size = 1024
+    num_attention_heads = 8
+    vocab_size = 512
+    seq_length = 512
+    micro_batch_size = 2
+    device = torch.device("cuda")
+    cuda_graph_warmup_steps = 3
+
+    input_ids, position_ids, attention_mask = _make_gpt_inputs(
+        seq_length=seq_length, micro_batch_size=micro_batch_size, device=device
+    )
+
+    off_interface.reset_instance()
+
+    try:
+        # 1) Baseline: mHC + CUDA graph enabled, offloading disabled
+        _reset_cuda_memory()
+        base_model = _build_gpt_model_with_cuda_graph(
+            seed=seed,
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            vocab_size=vocab_size,
+            seq_length=seq_length,
+            num_experts=num_experts,
+            fine_grained_activation_offloading=False,
+            offload_modules=None,
+            min_offloaded_tensor_size=1024 * 1024,
+            is_mla=False,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=cuda_graph_modules,
+            cuda_graph_warmup_steps=cuda_graph_warmup_steps,
+            enable_hyper_connections=True,
+            num_residual_streams=4,
+        ).cuda()
+        base_model.train()
+
+        base_logits, base_grads, base_peak = _run_iters_with_cuda_graph(
+            base_model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            num_warmup_iters=cuda_graph_warmup_steps,
+            num_measure_iters=2,
+            enable_offload_reset=False,
+        )
+        del base_model
+        _reset_cuda_memory()
+
+        # 2) Test: mHC + CUDA graph enabled + offloading enabled
+        off_interface.reset_instance()
+
+        off_model = _build_gpt_model_with_cuda_graph(
+            seed=seed,
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            vocab_size=vocab_size,
+            seq_length=seq_length,
+            num_experts=num_experts,
+            fine_grained_activation_offloading=True,
+            offload_modules=offload_modules,
+            min_offloaded_tensor_size=1024,
+            is_mla=False,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=cuda_graph_modules,
+            cuda_graph_warmup_steps=cuda_graph_warmup_steps,
+            delay_offload_until_cuda_graph=delay_offload,
+            enable_hyper_connections=True,
+            num_residual_streams=4,
+        ).cuda()
+        off_model.train()
+
+        off_logits, off_grads, off_peak = _run_iters_with_cuda_graph(
+            off_model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            num_warmup_iters=cuda_graph_warmup_steps,
+            num_measure_iters=2,
+            enable_offload_reset=True,
+        )
+        del off_model
+        _reset_cuda_memory()
+
+        # 3) Correctness checks
+        assert torch.allclose(
+            off_logits, base_logits, rtol=1e-2, atol=1e-2
+        ), f"mHC logits mismatch: max_diff={torch.max(torch.abs(off_logits - base_logits))}"
+        assert set(off_grads.keys()) == set(base_grads.keys())
+        for name, gb in base_grads.items():
+            go = off_grads[name]
+            if gb is None or go is None:
+                assert gb is None and go is None, f"Grad None mismatch for {name}"
+                continue
+            assert torch.allclose(
+                go, gb, rtol=1e-2, atol=1e-2
+            ), f"mHC grad mismatch for {name}: max_diff={torch.max(torch.abs(go - gb))}"
+
+        # 4) Memory and sanity checks
+        saved_mib = (base_peak - off_peak) / (1024**2)
+        print(
+            f"mHC + CUDA Graph + Offload test (delay={delay_offload}): "
+            f"base_peak={base_peak/(1024**2):.2f}MiB, "
+            f"off_peak={off_peak/(1024**2):.2f}MiB, "
+            f"saved={saved_mib:.2f}MiB"
+        )
+
+        assert not torch.isnan(off_logits).any(), "NaN detected in mHC logits"
+        assert not torch.isinf(off_logits).any(), "Inf detected in mHC logits"
+
+        for name, g in off_grads.items():
+            if g is not None:
+                assert not torch.isnan(g).any(), f"NaN detected in mHC grad for {name}"
+                assert not torch.isinf(g).any(), f"Inf detected in mHC grad for {name}"
+
+        assert saved_mib >= -CUDA_GRAPH_DELTA, (
+            f"mHC offloading with CUDA graph significantly increased memory: "
+            f"saved={saved_mib:.2f}MiB (negative means increase)"
+        )
+
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.flaky_in_dev
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+def test_mhc_recompute_with_non_conflicting_offload_modules():
+    """
+    Test that mHC recompute ('mhc' in recompute_modules) works correctly with
+    offload modules that do NOT overlap with mHC checkpoints.
+
+    mHC checkpoints wrap input_layernorm (inside attn_norm) and pre_mlp_layernorm
+    (inside mlp_norm). Other offload modules (qkv_linear, core_attn, attn_proj,
+    expert_fc1, moe_act) live inside self_attention/MLP which are not wrapped by
+    mHC checkpoints, so there is no backward hook ordering conflict.
+    """
+    offload_modules = ["qkv_linear", "core_attn", "attn_proj", "expert_fc1", "moe_act"]
+
+    os.environ.pop("NVTE_FUSED_ATTN", None)
+    os.environ.pop("NVTE_FLASH_ATTN", None)
+    os.environ.pop("NVTE_UNFUSED_ATTN", None)
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+
+    seed = 123
+    num_experts = 4
+    num_layers = 8
+    hidden_size = 1024
+    num_attention_heads = 8
+    vocab_size = 1024
+    seq_length = 1024
+    micro_batch_size = 2
+    device = torch.device("cuda")
+
+    input_ids, position_ids, attention_mask = _make_gpt_inputs(
+        seq_length=seq_length, micro_batch_size=micro_batch_size, device=device
+    )
+
+    off_interface.reset_instance()
+
+    try:
+        # 1) Baseline: mHC + mhc recompute, no offloading
+        _reset_cuda_memory()
+        base_model = _build_gpt_model(
+            seed=seed,
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            vocab_size=vocab_size,
+            seq_length=seq_length,
+            num_experts=num_experts,
+            fine_grained_activation_offloading=False,
+            offload_modules=None,
+            min_offloaded_tensor_size=1024 * 1024,
+            is_mla=False,
+            enable_hyper_connections=True,
+            mhc_recompute_layer_num=2,
+        ).cuda()
+        base_model.train()
+
+        _run_one_iter_and_capture(
+            base_model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            enable_offload_reset=False,
+        )
+        _reset_cuda_memory()
+        base_logits, base_grads, base_peak = _run_one_iter_and_capture(
+            base_model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            enable_offload_reset=False,
+        )
+        del base_model
+        _reset_cuda_memory()
+
+        # 2) mHC + mhc recompute + offloading (non-conflicting modules only)
+        off_model = _build_gpt_model(
+            seed=seed,
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            vocab_size=vocab_size,
+            seq_length=seq_length,
+            num_experts=num_experts,
+            fine_grained_activation_offloading=True,
+            offload_modules=offload_modules,
+            min_offloaded_tensor_size=1024,
+            is_mla=False,
+            enable_hyper_connections=True,
+            mhc_recompute_layer_num=2,
+        ).cuda()
+        off_model.train()
+
+        _run_one_iter_and_capture(
+            off_model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            enable_offload_reset=True,
+        )
+        off_interface.reset()
+
+        _reset_cuda_memory()
+        off_logits, off_grads, off_peak = _run_one_iter_and_capture(
+            off_model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            enable_offload_reset=True,
+        )
+        del off_model
+        _reset_cuda_memory()
+
+        # 3) Correctness checks
+        assert torch.allclose(off_logits, base_logits, rtol=1e-3, atol=1e-3), (
+            f"mHC recompute + offload logits mismatch: "
+            f"max_diff={torch.max(torch.abs(off_logits - base_logits))}"
+        )
+        assert set(off_grads.keys()) == set(base_grads.keys())
+        for name, gb in base_grads.items():
+            go = off_grads[name]
+            if gb is None or go is None:
+                assert gb is None and go is None, f"Grad None mismatch for {name}"
+                continue
+            assert torch.allclose(go, gb, rtol=1e-3, atol=1e-3), (
+                f"mHC recompute + offload grad mismatch for {name}: "
+                f"max_diff={torch.max(torch.abs(go - gb))}"
+            )
+
+        # 4) Memory checks
+        saved_mib = (base_peak - off_peak) / (1024**2)
+        assert saved_mib > 0.0, (
+            f"Expected GPU peak memory reduction for offload_modules={offload_modules}, "
+            f"but got saved={saved_mib:.2f}MiB"
+        )
+        print(f"mHC recompute + offload ({offload_modules}): " f"saved={saved_mib:.2f}MiB")
+
+    finally:
+        Utils.destroy_model_parallel()
