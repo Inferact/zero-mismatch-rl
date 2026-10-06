@@ -372,14 +372,11 @@ class NemotronHMTP(nn.Module, SupportsPP, SupportsQuant):
             prefix=maybe_prefix(prefix, "mtp"),
         )
 
-        # LM head for generating logits
+        # The MTP block has no LM head of its own: the checkpoint's `lm_head.*`
+        # is the target's, so the drafter always takes the target's module
+        # after loading (load_eagle_model) and follows its weight updates.
         self.has_own_lm_head = False
-        self.lm_head = ParallelLMHead(
-            self.config.vocab_size,
-            self.config.hidden_size,
-            quant_config=self.quant_config,
-            prefix=maybe_prefix(prefix, "lm_head"),
-        )
+        self.lm_head: ParallelLMHead | None = None
 
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
 
@@ -456,27 +453,15 @@ class NemotronHMTP(nn.Module, SupportsPP, SupportsQuant):
             # MTP weights are nested in "language_model."
             # in Multimodal Nemotron-H checkpoints.
             name = name.removeprefix("language_model.")
-            is_lm_head_weight = name.startswith("lm_head.")
-            if is_lm_head_weight:
-                self.has_own_lm_head = True
-            # Only process MTP and LM head weights -
-            # skip all non-MTP and non-LM head weights
-            if (
-                not name.startswith("mtp.")
-                and "embeddings" not in name
-                and not is_lm_head_weight
-            ):
+            # Only MTP weights: the embedding and LM head are the target's,
+            # shared after loading, so a target refit also updates the drafter.
+            if not name.startswith("mtp."):
                 continue
             # Skip rotary embeddings (computed, not loaded)
             if "rotary_emb.inv_freq" in name:
                 continue
 
             name = name.replace("mtp.layers.", "model.layers.")
-
-            if "embeddings" in name:
-                name = name.replace("embeddings", "embed_tokens")
-                if name.startswith("backbone."):
-                    name = name.replace("backbone.", "model.")
 
             if "scale" in name or "zero_point" in name:
                 remapped_name = maybe_remap_kv_scale_name(name, params_dict)
@@ -558,9 +543,6 @@ class NemotronHMTP(nn.Module, SupportsPP, SupportsQuant):
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
-        if not self.has_own_lm_head:
-            loaded_params.update(
-                name for name in params_dict if name.startswith("lm_head.")
-            )
-
+        # Replaced by the target's embedding after loading.
+        loaded_params.add("model.embed_tokens.weight")
         return loaded_params
