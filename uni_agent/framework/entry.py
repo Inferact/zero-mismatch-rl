@@ -113,6 +113,10 @@ class AgentFrameworkWorker:
     async def generate_sequences(self, prompts) -> None:
         await self.framework.generate_sequences(prompts)
 
+    async def pop_rollout_metrics(self, global_steps) -> dict:
+        pop = getattr(self.framework, "pop_rollout_metrics", None)
+        return {} if pop is None else await pop(global_steps)
+
 
 class AgentFrameworkRolloutAdapter:
     """Trainer-facing adapter satisfying the `agent_loop_manager_class` contract.
@@ -163,6 +167,12 @@ class AgentFrameworkRolloutAdapter:
 
         self.framework_worker.generate_sequences.remote(prompts)
         return None
+
+    def pop_rollout_metrics(self, global_steps) -> dict:
+        """Rollout metrics of an over-provisioned training step (e.g. ``rollout/groups_cut``), else ``{}``."""
+        if self.framework_worker is None:
+            raise RuntimeError("framework must be initialized before pop_rollout_metrics")
+        return ray.get(self.framework_worker.pop_rollout_metrics.remote(global_steps))
 
     def generate_sequences_and_wait(self, prompts) -> None:
         """Blocking variant of :meth:`generate_sequences` for standalone (non-trainer) runs.

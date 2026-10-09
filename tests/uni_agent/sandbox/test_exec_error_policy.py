@@ -23,7 +23,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from uni_agent.sandbox.base import ExecResult, Sandbox
+from uni_agent.sandbox.base import ExecResult, Sandbox, SandboxChannelError
 from uni_agent.sandbox.registry import get_sandbox_cls
 
 
@@ -85,6 +85,24 @@ def test_non_timeout_error_downgrades_to_127_when_alive():
     assert res.exit_code == 127
     assert res.stdout == ""
     assert res.stderr == "no such file"  # exact backend message, verbatim
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+def test_downgraded_error_is_flagged_as_infra_but_timeout_is_not():
+    # Callers that must not score a broken channel tell the two apart by infra_error.
+    downgraded = asyncio.run(_FakeSandbox(error=RuntimeError("envd gone"), alive=True).exec(["x"]))
+    timed_out = asyncio.run(_FakeSandbox(error=TimeoutError()).exec(["x"], timeout=1))
+    assert downgraded.infra_error == "RuntimeError: envd gone"
+    assert timed_out.infra_error is None
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+def test_channel_error_is_not_a_command_timeout():
+    res = asyncio.run(_FakeSandbox(error=SandboxChannelError("stream hung"), alive=True).exec(["x"], timeout=5))
+    assert res.exit_code == 127
+    assert res.infra_error == "SandboxChannelError: stream hung"
 
 
 @pytest.mark.cpu
@@ -410,6 +428,200 @@ def test_vefaas_install_command_downloads_then_execs():
     assert " -o /tmp/swe-rex-install.sh && exec bash /tmp/swe-rex-install.sh token123" in command
     assert "| bash" not in command
     assert "bash -s" not in command
+
+
+# --------------------------- e2b ---------------------------
+
+
+class _E2BCommandExit(Exception):
+    pass
+
+
+class _HungHandle:
+    def __init__(self):
+        self.killed = False
+
+    async def wait(self):
+        await asyncio.sleep(3600)
+
+    async def kill(self):
+        self.killed = True
+
+
+def _e2b_with_handle(monkeypatch, handle):
+    import sys
+
+    from uni_agent.sandbox.e2b import E2BSandbox
+
+    monkeypatch.setitem(sys.modules, "e2b", SimpleNamespace(CommandExitException=_E2BCommandExit))
+
+    async def run(command, **kwargs):
+        return handle
+
+    sb = E2BSandbox(template="t")
+    sb._sandbox = SimpleNamespace(commands=SimpleNamespace(run=run))
+    return sb
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.parametrize("timeout", [None, 0.05])
+def test_e2b_hung_stream_raises_channel_error_and_kills(monkeypatch, timeout):
+    """A stream silent past the hard bound is a broken channel, not a command timeout,
+    for timed commands (timeout + grace) and untimed ones (E2B_EXEC_HARD_TIMEOUT)."""
+    from uni_agent.sandbox import e2b
+
+    monkeypatch.setattr(e2b, "_EXEC_HARD_TIMEOUT_GRACE", 0.05)
+    monkeypatch.setenv("E2B_EXEC_HARD_TIMEOUT", "0.05")
+    handle = _HungHandle()
+    sb = _e2b_with_handle(monkeypatch, handle)
+
+    with pytest.raises(SandboxChannelError) as excinfo:
+        asyncio.run(sb._exec(["tmux", "ls"], timeout=timeout))
+    assert not sb._is_timeout_error(excinfo.value)
+    assert handle.killed
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+def test_e2b_hung_kill_does_not_hang_exec(monkeypatch):
+    """When the channel is broken the kill RPC can hang too; exec must still fail fast."""
+    from uni_agent.sandbox import e2b
+
+    class _HungKillHandle(_HungHandle):
+        async def kill(self):
+            await asyncio.sleep(3600)
+
+    monkeypatch.setattr(e2b, "_COMMAND_KILL_TIMEOUT", 0.05)
+    monkeypatch.setenv("E2B_EXEC_HARD_TIMEOUT", "0.05")
+    sb = _e2b_with_handle(monkeypatch, _HungKillHandle())
+
+    async def run():
+        return await asyncio.wait_for(sb._exec(["tmux", "ls"]), timeout=5)
+
+    with pytest.raises(SandboxChannelError):
+        asyncio.run(run())
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+def test_e2b_command_timeout_does_not_cancel_the_caller(monkeypatch):
+    """Regression: the SDK opens the stream under ``asyncio.timeout(timeout)`` in the
+    calling task but reads it from the handle's task, so an expiring command
+    timeout used to cancel the caller of ``_exec`` with a bare CancelledError."""
+    import sys
+
+    from uni_agent.sandbox import e2b
+    from uni_agent.sandbox.e2b import E2BSandbox
+
+    monkeypatch.setitem(sys.modules, "e2b", SimpleNamespace(CommandExitException=_E2BCommandExit))
+    monkeypatch.setattr(e2b, "_EXEC_HARD_TIMEOUT_GRACE", 0.2)
+    monkeypatch.setattr(e2b, "_COMMAND_KILL_TIMEOUT", 0.05)
+
+    class _StreamHandle:
+        def __init__(self, events):
+            self._drain = asyncio.ensure_future(self._consume(events))
+
+        @staticmethod
+        async def _consume(events):
+            async for _ in events:
+                pass
+
+        async def wait(self):
+            return await self._drain
+
+        async def kill(self):
+            self._drain.cancel()
+
+    async def run(command, *, timeout, **kwargs):
+        async def events():
+            async with asyncio.timeout(timeout):
+                yield "start"
+                await asyncio.sleep(3600)
+
+        stream = events()
+        await stream.__anext__()
+        return _StreamHandle(stream)
+
+    sb = E2BSandbox(template="t")
+    sb._sandbox = SimpleNamespace(commands=SimpleNamespace(run=run))
+
+    with pytest.raises(SandboxChannelError):
+        asyncio.run(sb._exec(["sleep", "100"], timeout=0.05))
+
+
+class _FakeAsyncSandbox:
+    created: list[dict] = []
+
+    def __init__(self):
+        self.sandbox_id = "sbx-1"
+        self.timeouts: list[int] = []
+        self.killed = False
+        self.files = SimpleNamespace(write=self._write)
+
+    async def _write(self, *args, **kwargs):
+        pass
+
+    @classmethod
+    async def create(cls, **kwargs):
+        cls.created.append(kwargs)
+        cls.last = cls()
+        return cls.last
+
+    async def set_timeout(self, timeout):
+        self.timeouts.append(timeout)
+
+    async def kill(self):
+        self.killed = True
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+def test_e2b_lease_is_renewed_while_alive_and_stops_with_sandbox(monkeypatch):
+    """With lease_seconds the sandbox is created with a short E2B timeout and a
+    keepalive renews it, so a process that dies without stop() leaks the sandbox
+    for one lease, not for runtime_timeout."""
+    import sys
+
+    from uni_agent.sandbox.e2b import E2BSandbox
+
+    monkeypatch.setitem(sys.modules, "e2b", SimpleNamespace(AsyncSandbox=_FakeAsyncSandbox))
+    monkeypatch.setenv("SLURM_JOB_ID", "4242")
+    _FakeAsyncSandbox.created = []
+    sb = E2BSandbox(template="t", runtime_timeout=7200, lease_seconds=3)
+
+    async def run():
+        await sb.start()
+        await asyncio.sleep(1.3)
+        await sb.stop()
+        renewals = list(_FakeAsyncSandbox.last.timeouts)
+        await asyncio.sleep(1.2)
+        return renewals
+
+    renewals = asyncio.run(run())
+    created = _FakeAsyncSandbox.created[0]
+    assert created["timeout"] == 3
+    assert created["metadata"]["slurm_job_id"] == "4242"
+    assert renewals == [3]
+    assert _FakeAsyncSandbox.last.timeouts == [3], "keepalive must stop with the sandbox"
+    assert _FakeAsyncSandbox.last.killed
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.parametrize(
+    ("exc", "transient"),
+    [
+        (type("RateLimitException", (Exception,), {})("Rate limit exceeded"), True),
+        (type("SandboxException", (Exception,), {"__module__": "e2b.exceptions"})("429: slow down"), True),
+        (type("SandboxException", (Exception,), {"__module__": "e2b.exceptions"})("503: busy"), True),
+        (type("SandboxException", (Exception,), {"__module__": "e2b.exceptions"})("400: bad cpu"), False),
+    ],
+)
+def test_e2b_rate_limit_is_transient(exc, transient):
+    from uni_agent.sandbox.e2b import _is_transient_provider_error
+
+    assert _is_transient_provider_error(exc) is transient
 
 
 if __name__ == "__main__":

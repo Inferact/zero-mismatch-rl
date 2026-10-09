@@ -131,12 +131,14 @@ async def _build_framework_with_agent_runners(
     trajectory_postprocessor_fqn: str | None = None,
     trajectory_postprocessor_kwargs: object | None = None,
     reward_config: dict[str, object] | None = None,
+    **agent_framework_overrides: object,
 ):
     from omegaconf import OmegaConf
 
     agent_framework_cfg: dict[str, object] = {
         "agent_runners": agent_runners,
         "mask_unfinished_episode": mask_unfinished_episode,
+        **agent_framework_overrides,
     }
     if log_dir is not None:
         agent_framework_cfg["log_dir"] = log_dir
@@ -408,9 +410,20 @@ class _FakeTransferQueue:
     def __init__(self):
         self.puts = []
         self.batch_puts = []
+        self.clears = []
 
     async def async_kv_put(self, *, key, partition_id, tag):
         self.puts.append({"key": key, "partition_id": partition_id, "tag": dict(tag)})
+
+    async def async_kv_clear(self, *, keys, partition_id):
+        self.clears.append({"keys": list(keys), "partition_id": partition_id})
+
+    async def async_kv_list(self, partition_id):
+        tags = {}
+        for put in self.puts:
+            if put["partition_id"] == partition_id:
+                tags.setdefault(put["key"], {}).update(put["tag"])
+        return {partition_id: tags}
 
     async def async_kv_batch_put(self, *, keys, fields, tags, partition_id):
         self.batch_puts.append(
@@ -471,8 +484,11 @@ def _build_prompts(
     global_steps: int | None = 7,
     validate: bool | None = None,
     do_sample: bool | None = None,
+    target_groups: int | None = None,
 ):
     non_tensor_dict = {"global_steps": global_steps}
+    if target_groups is not None:
+        non_tensor_dict["__target_groups__"] = target_groups
     if validate is not None:
         non_tensor_dict["validate"] = validate
     tensor_dict = {
@@ -1886,6 +1902,501 @@ async def test_generate_sequences_keeps_other_prompts_when_one_prompt_fails(fake
     assert all(session_id.startswith("session-sample-1-rollout-0-") for session_id in runtime.finalized_sessions)
 
 
+async def _cancelling_runner(**kwargs):
+    raise asyncio.CancelledError()
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session_timeout_seconds", [None, 30.0])
+async def test_cancelled_error_inside_one_session_fails_only_that_session(fake_tq, session_timeout_seconds):
+    """Regression: a CancelledError raised inside a session (not an outer cancel)
+    used to propagate out of its group and kill generate_sequences, leaving groups
+    tagged ``running`` forever. It must fail only that session."""
+    runtime = _all_sessions_runtime(num_prompts=2, n=2)
+
+    async def agent_runner(*, session, **kwargs):
+        if session.session_id.startswith("session-sample-0-rollout-1-"):
+            raise asyncio.CancelledError()
+        return TaskResult()
+
+    runner_config = _inline_runner_config(agent_runner)
+    runner_config["session_timeout_seconds"] = session_timeout_seconds
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": runner_config},
+        gateway_manager=runtime,
+        n=2,
+    )
+
+    await asyncio.wait_for(framework.generate_sequences(_build_prompts(count=2, global_steps=13)), timeout=5)
+
+    assert {put["key"]: put["tag"]["status"] for put in fake_tq.puts} == {"uid-0": "finished", "uid-1": "finished"}
+    assert sorted(key for put in fake_tq.batch_puts for key in put["keys"]) == ["uid-0_0_0", "uid-1_0_0", "uid-1_1_0"]
+    assert [s.split("-rollout-")[0] for s in runtime.aborted_sessions] == ["session-sample-0"]
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_ray_runner_cancelled_error_is_a_session_failure_not_a_cancel(monkeypatch, fake_tq):
+    """Ray re-raises a runner's CancelledError as RayTaskError(CancelledError), which
+    is also an asyncio.CancelledError; it must fail the session without ray.cancel."""
+    from ray.exceptions import RayTaskError
+
+    from uni_agent.framework import framework as framework_module
+
+    cancel_calls = []
+
+    class _Ref:
+        def __init__(self, sample_index):
+            self.sample_index = sample_index
+
+        def __await__(self):
+            fut: asyncio.Future = asyncio.get_running_loop().create_future()
+            if self.sample_index == 0:
+                fut.set_exception(RayTaskError("runner", "tb", asyncio.CancelledError()).as_instanceof_cause())
+            else:
+                fut.set_result(TaskResult())
+            return fut.__await__()
+
+    monkeypatch.setattr(
+        framework_module._run_agent_runner_ray_task, "remote", lambda **kwargs: _Ref(kwargs["sample_index"])
+    )
+    monkeypatch.setattr(
+        framework_module, "ray", types.SimpleNamespace(cancel=lambda ref, **kw: cancel_calls.append(ref))
+    )
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={
+            "runner": {
+                "runner_fqn": "tests.uni_agent.support.logging_runner",
+                "dispatch_mode": "ray_task",
+                "session_timeout_seconds": 30.0,
+            }
+        },
+        gateway_manager=_all_sessions_runtime(num_prompts=2, n=1),
+        max_failed_prompt_fraction=0.5,
+    )
+
+    await asyncio.wait_for(framework.generate_sequences(_build_prompts(count=2, global_steps=14)), timeout=5)
+
+    assert cancel_calls == []
+    assert {put["key"]: put["tag"]["status"] for put in fake_tq.puts} == {"uid-0": "failure", "uid-1": "finished"}
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+def test_ray_runner_task_turns_inner_cancelled_error_into_runtime_error():
+    """A CancelledError leaving the runner's asyncio.run was raised inside the
+    runner; the Ray task reports it as an ordinary failure."""
+    from uni_agent.framework.framework import _run_agent_runner_ray_task
+
+    with pytest.raises(RuntimeError, match="cancelled from inside its event loop"):
+        _run_agent_runner_ray_task._function(
+            runner_fqn=f"{__name__}._cancelling_runner",
+            runner_kwargs={},
+            raw_prompt=[],
+            session=None,
+            sample_index=3,
+            tools_kwargs=None,
+            log_context=None,
+        )
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_dying_generate_sequences_tags_unresolved_prompts_as_failure(fake_tq):
+    """The trainer only polls TQ tags, so if generate_sequences dies (here: the
+    actor call is cancelled) every prompt still running must be tagged failure."""
+    release = asyncio.Event()
+
+    async def agent_runner(*, sample_index, **kwargs):
+        if sample_index == 1:
+            await release.wait()
+        return TaskResult()
+
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(agent_runner)},
+        gateway_manager=_all_sessions_runtime(num_prompts=2, n=1),
+    )
+    task = asyncio.ensure_future(framework.generate_sequences(_build_prompts(count=2, global_steps=15)))
+    while not any(put["tag"]["status"] == "finished" for put in fake_tq.puts):
+        await asyncio.sleep(0.01)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+
+    terminal = {put["key"]: put["tag"]["status"] for put in fake_tq.puts}
+    assert terminal == {"uid-0": "finished", "uid-1": "failure"}
+
+
+def _runner_failing_sessions(failing: set[tuple[int, int]]):
+    async def agent_runner(*, session, sample_index, **kwargs):
+        if any(session.session_id.startswith(f"session-sample-{s}-rollout-{r}-") for s, r in failing):
+            raise RuntimeError("sandbox unreachable")
+        return TaskResult()
+
+    return agent_runner
+
+
+def _all_sessions_runtime(num_prompts: int, n: int) -> _FakeGatewayManager:
+    return _FakeGatewayManager(
+        {f"session-sample-{s}-rollout-{r}-": [_trajectory()] for s in range(num_prompts) for r in range(n)}
+    )
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_generate_sequences_drops_groups_below_min_group_size(fake_tq):
+    """A group that lost too many sessions is not written, so GRPO never sees a
+    tiny, failure-biased group; it counts as a failed prompt."""
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_runner_failing_sessions({(0, 0), (0, 1)}))},
+        gateway_manager=_all_sessions_runtime(num_prompts=2, n=4),
+        n=4,
+        min_group_size=3,
+        max_failed_prompt_fraction=0.5,
+    )
+
+    await framework.generate_sequences(_build_prompts(count=2, global_steps=12))
+
+    assert sorted(key for put in fake_tq.batch_puts for key in put["keys"]) == [f"uid-1_{r}_0" for r in range(4)]
+    assert {put["key"]: put["tag"]["status"] for put in fake_tq.puts} == {"uid-0": "failure", "uid-1": "finished"}
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_dropped_groups_count_against_max_failed_prompt_fraction(fake_tq):
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_runner_failing_sessions({(0, 0)}))},
+        gateway_manager=_all_sessions_runtime(num_prompts=2, n=2),
+        n=2,
+        min_group_size=2,
+        max_failed_prompt_fraction=0.25,
+    )
+
+    with pytest.raises(RuntimeError, match="Too many failed prompts"):
+        await framework.generate_sequences(_build_prompts(count=2, global_steps=13))
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("max_failed_session_fraction", "raises"), [(0.25, True), (1.0, False)])
+async def test_partial_session_loss_trips_max_failed_session_fraction(fake_tq, max_failed_session_fraction, raises):
+    """Losing 3 of 4 sessions in every group keeps every prompt alive, so only the
+    session-level guard catches it."""
+    failing = {(s, r) for s in range(2) for r in range(1, 4)}
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_runner_failing_sessions(failing))},
+        gateway_manager=_all_sessions_runtime(num_prompts=2, n=4),
+        n=4,
+        max_failed_prompt_fraction=0.0,
+        max_failed_session_fraction=max_failed_session_fraction,
+    )
+
+    if raises:
+        with pytest.raises(RuntimeError, match=r"Too many failed sessions at global_steps=14: 6/8"):
+            await framework.generate_sequences(_build_prompts(count=2, global_steps=14))
+    else:
+        await framework.generate_sequences(_build_prompts(count=2, global_steps=14))
+        assert len(fake_tq.batch_puts) == 2
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"min_group_size": 0},
+        {"min_group_size": 1.5},
+        {"max_failed_session_fraction": 1.5},
+        {"over_provision_groups": -1},
+        {"over_provision_groups": 1.5},
+    ],
+)
+async def test_framework_rejects_invalid_group_guards(overrides):
+    with pytest.raises(ValueError):
+        await _build_framework_with_agent_runners(
+            agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
+            gateway_manager=_FakeGatewayManager({}),
+            **overrides,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Over-provision and cut
+# ---------------------------------------------------------------------------
+
+
+class _SlowGroupRunner:
+    """Runner whose groups finish after a per-prompt delay; ``None`` hangs until cancelled.
+
+    A hung session records its cancellation and the teardown of its "sandbox" so a
+    test can check that a cut group's sessions were stopped, not just abandoned.
+    """
+
+    def __init__(self, delays: dict[int, float | None], failing: set[tuple[int, int]] = frozenset()):
+        self.delays = delays
+        self.failing = set(failing)
+        self.cancelled: list[int] = []
+        self.sandboxes_torn_down: list[int] = []
+
+    async def __call__(self, *, session, sample_index, **kwargs):
+        if any(session.session_id.startswith(f"session-sample-{s}-rollout-{r}-") for s, r in self.failing):
+            raise RuntimeError("sandbox unreachable")
+        delay = self.delays.get(sample_index, 0.0)
+        try:
+            if delay is None:
+                await asyncio.Event().wait()
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            self.cancelled.append(sample_index)
+            raise
+        finally:
+            if delay is None:
+                self.sandboxes_torn_down.append(sample_index)
+        return TaskResult()
+
+
+def _written_uids(fake_tq) -> list[str]:
+    return [put["keys"][0].split("_")[0] for put in fake_tq.batch_puts]
+
+
+def _status_tags(fake_tq, status: str) -> list[str]:
+    return [put["key"] for put in fake_tq.puts if put["tag"]["status"] == status]
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+@pytest.mark.parametrize("configured_by", ["over_provision_groups", "stamped_target"])
+async def test_over_provision_keeps_first_finished_groups_in_prompt_order_and_cuts_the_rest(fake_tq, configured_by):
+    """6 prompts with 2 to spare: the 2 slow groups are cut once 4 have finished.
+
+    Kept groups reach TQ in prompt order although they finished in reverse order;
+    the cut groups' sessions are cancelled (sandbox torn down, Gateway session
+    aborted) and their prompt keys cleared, so the trainer sees exactly 4 groups.
+    """
+    runner = _SlowGroupRunner({0: 0.06, 1: None, 2: 0.04, 3: 0.02, 4: None, 5: 0.0})
+    runtime = _all_sessions_runtime(num_prompts=6, n=2)
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(runner)},
+        gateway_manager=runtime,
+        n=2,
+        **({"over_provision_groups": 2} if configured_by == "over_provision_groups" else {}),
+    )
+    target = 4 if configured_by == "stamped_target" else None
+
+    await asyncio.wait_for(
+        framework.generate_sequences(_build_prompts(count=6, global_steps=21, target_groups=target)), timeout=5
+    )
+
+    assert _written_uids(fake_tq) == ["uid-0", "uid-0", "uid-2", "uid-2", "uid-3", "uid-3", "uid-5", "uid-5"]
+    assert _status_tags(fake_tq, "finished") == ["uid-0", "uid-2", "uid-3", "uid-5"]
+    assert _status_tags(fake_tq, "failure") == []
+    assert fake_tq.clears == [{"keys": ["uid-1", "uid-4"], "partition_id": "train"}]
+    assert sorted(runner.cancelled) == sorted(runner.sandboxes_torn_down) == [1, 1, 4, 4]
+    assert (
+        sorted(s.split("-rollout-")[0] for s in runtime.aborted_sessions)
+        == ["session-sample-1"] * 2 + ["session-sample-4"] * 2
+    )
+    assert await framework.pop_rollout_metrics(21) == {
+        "rollout/groups_launched": 6,
+        "rollout/groups_target": 4,
+        "rollout/groups_kept": 4,
+        "rollout/groups_cut": 2,
+        "rollout/groups_failed": 0,
+        "rollout/sessions_failed": 0,
+    }
+    assert await framework.pop_rollout_metrics(21) == {}
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_over_provision_replaces_failed_groups_and_cut_is_not_a_failure(fake_tq, caplog):
+    """A fully failed group is replaced by a spare one instead of being reported;
+    a group that lost one session but kept min_group_size counts as finished; the
+    cut group is neither a failure nor in the failure-guard denominator."""
+    runner = _SlowGroupRunner({3: 0.02, 4: None}, failing={(0, 0), (0, 1), (1, 0)})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(runner)},
+        gateway_manager=_all_sessions_runtime(num_prompts=5, n=2),
+        n=2,
+        min_group_size=1,
+        over_provision_groups=2,
+        # 1 failed prompt of 4 resolved passes; counting the cut group as failed would not.
+        max_failed_prompt_fraction=0.25,
+    )
+
+    with caplog.at_level(logging.INFO, logger="uni_agent.framework.framework"):
+        await asyncio.wait_for(framework.generate_sequences(_build_prompts(count=5, global_steps=22)), timeout=5)
+
+    assert _written_uids(fake_tq) == ["uid-1", "uid-2", "uid-2", "uid-3", "uid-3"]
+    assert _status_tags(fake_tq, "finished") == ["uid-1", "uid-2", "uid-3"]
+    assert _status_tags(fake_tq, "failure") == []
+    assert fake_tq.clears == [
+        {"keys": ["uid-0"], "partition_id": "train"},
+        {"keys": ["uid-4"], "partition_id": "train"},
+    ]
+    metrics = await framework.pop_rollout_metrics(22)
+    assert (metrics["rollout/groups_cut"], metrics["rollout/groups_failed"], metrics["rollout/sessions_failed"]) == (
+        1,
+        1,
+        3,
+    )
+    cut_log = next(record.getMessage() for record in caplog.records if "over-provision cut" in record.getMessage())
+    assert "(4, 'uid-4', 'in flight when target_groups was reached')" in cut_log
+    assert "(0, 'uid-0', 'every session failed')" in cut_log
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_over_provision_reports_failures_when_too_few_groups_finish(fake_tq):
+    """With more failures than spares nothing is cut, and failed groups fill the
+    batch as ``failure`` (lowest prompt index first) so the trainer still sees
+    exactly target_groups terminal groups; the surplus failed group is cleared."""
+    runner = _SlowGroupRunner({}, failing={(0, 0), (0, 1), (2, 0), (3, 0), (3, 1)})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(runner)},
+        gateway_manager=_all_sessions_runtime(num_prompts=5, n=2),
+        n=2,
+        min_group_size=2,
+        over_provision_groups=1,
+    )
+
+    await asyncio.wait_for(framework.generate_sequences(_build_prompts(count=5, global_steps=23)), timeout=5)
+
+    assert _status_tags(fake_tq, "finished") == ["uid-1", "uid-4"]
+    assert _status_tags(fake_tq, "failure") == ["uid-0", "uid-2"]
+    assert fake_tq.clears == [{"keys": ["uid-3"], "partition_id": "train"}]
+    metrics = await framework.pop_rollout_metrics(23)
+    assert (metrics["rollout/groups_kept"], metrics["rollout/groups_cut"], metrics["rollout/groups_failed"]) == (
+        2,
+        0,
+        3,
+    )
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("max_failed_session_fraction", "raises"), [(0.2, True), (0.25, False)])
+async def test_over_provision_session_guard_excludes_cut_groups(fake_tq, max_failed_session_fraction, raises):
+    """2 lost sessions out of the 8 that ran; the 8 cut sessions are not counted."""
+    runner = _SlowGroupRunner({2: None, 3: None}, failing={(0, 0), (0, 1)})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(runner)},
+        gateway_manager=_all_sessions_runtime(num_prompts=4, n=4),
+        n=4,
+        over_provision_groups=2,
+        max_failed_session_fraction=max_failed_session_fraction,
+    )
+
+    run = framework.generate_sequences(_build_prompts(count=4, global_steps=24))
+    if raises:
+        with pytest.raises(RuntimeError, match=r"Too many failed sessions at global_steps=24: 2/8"):
+            await asyncio.wait_for(run, timeout=5)
+    else:
+        await asyncio.wait_for(run, timeout=5)
+    assert _status_tags(fake_tq, "finished") == ["uid-0", "uid-1"]
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_over_provision_never_cuts_validation(fake_tq):
+    runner = _SlowGroupRunner({0: 0.02})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(runner)},
+        gateway_manager=_all_sessions_runtime(num_prompts=3, n=1),
+        over_provision_groups=2,
+    )
+
+    await asyncio.wait_for(
+        framework.generate_sequences(_build_prompts(count=3, global_steps=25, validate=True)), timeout=5
+    )
+
+    assert sorted(_status_tags(fake_tq, "finished")) == ["uid-0", "uid-1", "uid-2"]
+    assert fake_tq.clears == []
+    assert await framework.pop_rollout_metrics(25) == {}
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_over_provision_rejects_batch_with_nothing_to_keep(fake_tq):
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_SlowGroupRunner({}))},
+        gateway_manager=_all_sessions_runtime(num_prompts=2, n=1),
+        over_provision_groups=2,
+    )
+
+    with pytest.raises(ValueError, match="target_groups=0"):
+        await framework.generate_sequences(_build_prompts(count=2, global_steps=26))
+    assert fake_tq.puts == []
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_over_provision_cut_cancels_ray_runner_task(monkeypatch, fake_tq):
+    """A cut ray_task session gets a graceful ``ray.cancel`` (so the runner's sandbox
+    context manager tears down) and its Gateway session is aborted."""
+    from uni_agent.framework import framework as framework_module
+
+    cancel_calls: list[int] = []
+
+    class _Ref:
+        def __init__(self, sample_index):
+            self.sample_index = sample_index
+            self.cancelled = False
+
+        def __await__(self):
+            fut: asyncio.Future = asyncio.get_running_loop().create_future()
+            if self.cancelled:
+                fut.set_exception(RuntimeError("TaskCancelledError"))
+            elif self.sample_index == 0:
+                fut.set_result(TaskResult())
+            return fut.__await__()
+
+    def fake_cancel(ref, *, force=False):
+        assert not force
+        cancel_calls.append(ref.sample_index)
+        ref.cancelled = True
+
+    monkeypatch.setattr(
+        framework_module._run_agent_runner_ray_task, "remote", lambda **kwargs: _Ref(kwargs["sample_index"])
+    )
+    monkeypatch.setattr(framework_module, "ray", types.SimpleNamespace(cancel=fake_cancel))
+    runtime = _all_sessions_runtime(num_prompts=2, n=1)
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={
+            "runner": {
+                "runner_fqn": "tests.uni_agent.support.logging_runner",
+                "dispatch_mode": "ray_task",
+                "session_timeout_seconds": 30.0,
+            }
+        },
+        gateway_manager=runtime,
+        over_provision_groups=1,
+    )
+
+    await asyncio.wait_for(framework.generate_sequences(_build_prompts(count=2, global_steps=27)), timeout=5)
+
+    assert cancel_calls == [1]
+    assert [s.split("-rollout-")[0] for s in runtime.aborted_sessions] == ["session-sample-1"]
+    assert _status_tags(fake_tq, "finished") == ["uid-0"]
+    assert fake_tq.clears == [{"keys": ["uid-1"], "partition_id": "train"}]
+
+
 # ---------------------------------------------------------------------------
 # _score_trajectories method-level tests
 # ---------------------------------------------------------------------------
@@ -2056,6 +2567,56 @@ async def test_ray_task_termination_cancels_runner_and_aborts_session(monkeypatc
     # so no force-kill escalation happened.
     assert [call["force"] for call in cancel_calls] == [False]
     assert runtime.aborted_sessions, "terminated session must be aborted"
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hang_in", ["runner", "finalize", "finalize_and_abort"])
+async def test_session_timeout_fails_only_the_hung_session(fake_tq, hang_in):
+    """A session hung anywhere (runner, Gateway finalize, even its own abort) is
+    failed by session_timeout_seconds; its group-mates still reach TQ and the
+    step returns instead of waiting on the hung session forever."""
+    hung_prefix = "session-sample-0-rollout-1-"
+
+    class _GatewayManager(_FakeGatewayManager):
+        async def finalize_session(self, session_id: str):
+            if hang_in != "runner" and session_id.startswith(hung_prefix):
+                await asyncio.Event().wait()
+            return await super().finalize_session(session_id)
+
+        async def abort_session(self, session_id: str) -> None:
+            await super().abort_session(session_id)
+            if hang_in == "finalize_and_abort":
+                await asyncio.Event().wait()
+
+    async def agent_runner(*, session, **kwargs):
+        if hang_in == "runner" and session.session_id.startswith(hung_prefix):
+            await asyncio.Event().wait()
+        return TaskResult()
+
+    runtime = _GatewayManager(
+        {
+            "session-sample-0-rollout-0": [_trajectory()],
+            "session-sample-0-rollout-1": [_trajectory()],
+        }
+    )
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": {**_inline_runner_config(agent_runner), "session_timeout_seconds": 0.2}},
+        gateway_manager=runtime,
+        n=2,
+    )
+    framework._SESSION_ABORT_TIMEOUT_SECONDS = 0.1
+
+    stats = await asyncio.wait_for(
+        framework._run_batch_rollouts(_build_prompts(count=1), global_steps=7, partition_id="train", num_sessions=2),
+        timeout=5,
+    )
+
+    assert (stats["num_success_sessions"], stats["num_failed_sessions"]) == (1, 1)
+    assert "session_timeout_seconds=0.2" in stats["failure_reasons"][0]
+    assert fake_tq.batch_puts[0]["keys"] == ["uid-0_0_0"]
+    assert [s[: len(hung_prefix)] for s in runtime.aborted_sessions] == [hung_prefix]
 
 
 @pytest.mark.cpu

@@ -42,6 +42,17 @@ class ExecResult:
     exit_code: int
     stdout: str
     stderr: str
+    #: Set when the backend raised instead of reporting the command's outcome
+    #: (transport failure, hung stream); ``exit_code`` is then synthetic.
+    infra_error: str | None = None
+
+
+class SandboxChannelError(RuntimeError):
+    """The exec channel stopped responding after the command's own deadline.
+
+    Deliberately not a :class:`TimeoutError`: a command timeout is an outcome the
+    caller may act on, a hung channel means the outcome is unknown.
+    """
 
 
 def _name_tag(ref: str) -> tuple[str, str | None]:
@@ -407,7 +418,9 @@ class Sandbox(abc.ABC):
                 return ExecResult(exit_code=-1, stdout="", stderr=f"exec timed out after {timeout}s: {exc}")
             if not await self.is_alive():
                 raise
-            return ExecResult(exit_code=127, stdout="", stderr=str(exc))
+            return ExecResult(
+                exit_code=127, stdout="", stderr=str(exc), infra_error=f"{type(exc).__name__}: {exc}"[:512]
+            )
 
     def _is_timeout_error(self, exc: BaseException) -> bool:
         """Whether ``exc`` from :meth:`_exec` represents a command timeout.

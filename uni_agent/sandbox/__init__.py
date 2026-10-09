@@ -7,7 +7,7 @@ protocol, never on lifecycle.
 
 from __future__ import annotations
 
-from .base import ExecResult, ImageMap, Sandbox, SandboxBackend, SandboxConfig
+from .base import ExecResult, ImageMap, Sandbox, SandboxBackend, SandboxChannelError, SandboxConfig
 
 # Host-local provider is stdlib-only: import (and register) it eagerly. Heavier
 # providers (e.g. ``modal``) stay lazy via the registry's module map.
@@ -19,6 +19,7 @@ __all__ = [
     "ImageMap",
     "Sandbox",
     "SandboxBackend",
+    "SandboxChannelError",
     "SandboxConfig",
     "LocalSandbox",
     "build_sandbox",
