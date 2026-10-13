@@ -204,6 +204,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
         if isinstance(grad_norm, torch.Tensor):
             grad_norm = grad_norm.detach().item()
         lr = metrics.pop("lr", None)
+        mtp_grad_norm = metrics.pop("mtp_grad_norm", None)
+        if isinstance(mtp_grad_norm, torch.Tensor):
+            mtp_grad_norm = mtp_grad_norm.detach().item()
 
         # For other metrics, we perform all gather in dp group (only if DP > 1)
         if dp_group is not None:
@@ -215,6 +218,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
             final_metrics["grad_norm"] = grad_norm
         if lr is not None:
             final_metrics["lr"] = lr
+        if mtp_grad_norm is not None:
+            final_metrics["mtp/grad_norm"] = mtp_grad_norm
 
         # log memory
         final_metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)

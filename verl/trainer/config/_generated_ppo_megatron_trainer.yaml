@@ -56,6 +56,8 @@ actor_rollout_ref:
       use_distributed_optimizer: true
       use_dist_checkpointing: false
       dist_checkpointing_path: null
+      hf_weights_path: null
+      mixed_precision_export: false
       dynamic_context_parallel: false
       max_seqlen_per_dp_cp_rank: null
       dist_checkpointing_prefix: ''
@@ -263,6 +265,8 @@ actor_rollout_ref:
       use_distributed_optimizer: true
       use_dist_checkpointing: false
       dist_checkpointing_path: null
+      hf_weights_path: null
+      mixed_precision_export: false
       dynamic_context_parallel: ${oc.select:actor_rollout_ref.actor.megatron.dynamic_context_parallel,False}
       max_seqlen_per_dp_cp_rank: ${oc.select:actor_rollout_ref.actor.megatron.max_seqlen_per_dp_cp_rank,null}
       dist_checkpointing_prefix: ''
@@ -311,6 +315,7 @@ actor_rollout_ref:
     top_p: 1
     full_determinism: false
     seed: 42
+    pin_dp_rank_by_session: false
     prompt_length: ${oc.select:data.max_prompt_length,512}
     response_length: ${oc.select:data.max_response_length,512}
     dtype: bfloat16
@@ -478,6 +483,7 @@ actor_rollout_ref:
       enable_rollout: false
       detach_encoder: false
       mtp_loss_scaling_factor: 0.1
+      lr: null
       speculative_algorithm: EAGLE
       speculative_num_steps: 3
       speculative_eagle_topk: 1
@@ -598,6 +604,8 @@ critic:
     use_distributed_optimizer: true
     use_dist_checkpointing: false
     dist_checkpointing_path: null
+    hf_weights_path: null
+    mixed_precision_export: false
     dynamic_context_parallel: false
     max_seqlen_per_dp_cp_rank: null
     dist_checkpointing_prefix: ''
@@ -738,6 +746,7 @@ critic:
       enable_rollout: false
       detach_encoder: false
       mtp_loss_scaling_factor: 0.1
+      lr: null
       speculative_algorithm: EAGLE
       speculative_num_steps: 3
       speculative_eagle_topk: 1
@@ -1033,6 +1042,7 @@ trainer:
       max_off_policy_threshold: 8
       max_off_policy_strategy: drop
       sync_refill_failed_groups: false
+      sync_over_provision_prompts: 0
       custom_sampler:
         path: null
         name: null

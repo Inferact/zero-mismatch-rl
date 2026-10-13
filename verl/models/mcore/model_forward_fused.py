@@ -31,7 +31,7 @@ from megatron.core.utils import deprecate_inference_params
 from packaging import version
 from torch import Tensor
 
-from verl.models.mcore.util import preprocess_thd_engine, preprocess_vlm_thd_engine
+from verl.models.mcore.util import has_mamba_layers, preprocess_thd_engine, preprocess_vlm_thd_engine
 from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
 from verl.utils.megatron_utils import unwrap_model
 from verl.utils.model import CausalLMOutputForPPO
@@ -209,7 +209,10 @@ def fused_forward_model_engine(vision_model: bool = False):
             local_cp_size=local_cp_size,
         )
         input_ids_rmpad, packed_seq_params, _ = preprocess_thd_engine(
-            input_ids, pre_process=pre_process or vision_model, **thd_kwargs
+            input_ids,
+            pre_process=pre_process or vision_model,
+            mamba_seq_idx=has_mamba_layers(unwrap_model(model)),
+            **thd_kwargs,
         )
         attention_mask = None
         position_ids_rmpad = None

@@ -29,6 +29,7 @@ import torch
 import transfer_queue as tq
 from transfer_queue import KVBatchMeta
 
+from verl.trainer.ppo.padding_utils import upsample_batch_to_divisible_size
 from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer, ReplayBufferAsync
 
 # Small poll interval so the blocking consumer reacts to producer writes quickly.
@@ -429,6 +430,39 @@ def test_sync_all_empty_failures_raise_without_refill(tq_init, partition_id):
         with pytest.raises(RuntimeError, match="sync_refill_failed_groups"):
             rb.sample(global_steps=0, partition_id=partition_id, batch_size=2)
     finally:
+        _clear_partition(partition_id)
+
+
+def test_sync_over_provisioned_step_trains_on_kept_groups_only(tq_init, partition_id):
+    """trainer.v1.sampler.sync_over_provision_prompts: 3 prompts are launched for a
+    batch of 2 and the rollout cuts the slowest one (its prompt key is cleared, it
+    has no trajectories). sample returns exactly the 2 kept groups; a kept group
+    that lost a session makes the batch smaller, and the existing padding path fills
+    it up to the mini-batch multiple. The cut group never reaches the next step."""
+    kept_full = PromptSpec(uid=_uid(), status="finished", sessions=2)
+    kept_short = PromptSpec(uid=_uid(), status="finished", sessions=1)
+    cut_uid = _uid()
+    for uid in (kept_full.uid, kept_short.uid, cut_uid):
+        _set_prompt_status(partition_id, uid, "running", global_steps=0)
+
+    rb = _make_rb()
+    consumer = SampleConsumer(rb, partition_id, batch_size=2)
+    try:
+        consumer.start()
+        _produce(partition_id, [kept_full, kept_short]).join_and_check()
+        tq.kv_clear(partition_id=partition_id, keys=[cut_uid])
+        batch = consumer.result_or_raise()
+
+        assert set(batch.keys) == {*kept_full.trajectory_keys, *kept_short.trajectory_keys}
+        padded = upsample_batch_to_divisible_size(batch, batch_multiple=4, eos_token_id=0)
+        assert [tag.get("is_padding", False) for tag in padded.tags] == [False, False, False, True]
+        tq.kv_clear(partition_id=partition_id, keys=padded.keys)
+
+        next_step = PromptSpec(uid=_uid(), status="finished", sessions=1, global_steps=1)
+        _produce(partition_id, [next_step]).join_and_check()
+        assert _uids_of(_sample(rb, partition_id, batch_size=1, global_steps=1).keys) == {next_step.uid}
+    finally:
+        consumer.join(timeout=10.0)
         _clear_partition(partition_id)
 
 

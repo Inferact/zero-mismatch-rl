@@ -538,6 +538,7 @@ def test_builtin_family_class_mapping(family, builder_cls):
         ("qwen3", ContinuousTokenModelFamily.QWEN3),
         ("qwen3_moe", ContinuousTokenModelFamily.QWEN3),
         ("qwen2", ContinuousTokenModelFamily.QWEN),
+        ("nemotron_h", ContinuousTokenModelFamily.QWEN),
         ("deepseek_v2", ContinuousTokenModelFamily.DEEPSEEK),
         ("deepseek_v3", ContinuousTokenModelFamily.DEEPSEEK),
         ("deepseek_v4", ContinuousTokenModelFamily.DEEPSEEKV4),

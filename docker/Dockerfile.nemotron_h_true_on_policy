@@ -1,0 +1,234 @@
+# syntax=docker/dockerfile:1.7
+
+# -----------------------------------------------------------------------------
+# Base image and release pins
+# -----------------------------------------------------------------------------
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.07-py3
+ARG BASE_IMAGE_DIGEST=sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c
+ARG TARGETARCH=arm64
+
+# vLLM, Megatron-LM (megatron.lite, verl_mlite) and VERL (this build context)
+# are installed in the image.
+ARG VLLM_REPO=https://github.com/aoshen02/vllm.git
+ARG VLLM_REF=refs/heads/pr/nemotron-h-bi-cutedsl-p6
+ARG VLLM_REVISION=0e2bd8dd55b959a3d8747030cd30f414440854ab
+ARG VLLM_TREE=9d49cdd51292698bc40a1b75a671abda7529a530
+# What setuptools-scm derives for VLLM_REVISION from upstream's release tag.
+ARG VLLM_VERSION=0.30.1rc1.dev633+g0e2bd8dd5
+ARG VLLM_TAG_REPO=https://github.com/vllm-project/vllm.git
+ARG VLLM_BASE_TAG=v0.30.1rc0
+
+ARG MEGATRON_REPO=https://github.com/aoshen02/Megatron-LM.git
+ARG MEGATRON_REVISION=00a9a48b124f1441ea18821aacdfd0dfd1241f49
+# Megatron-Core's Mamba kernels; mamba-ssm needs the state_dtype argument
+# (state-spaces/mamba#972).
+ARG CAUSAL_CONV1D_REVISION=4f6ae4e26ae5fe8af9372f8d312ab25cc4595223
+ARG MAMBA_SSM_REVISION=0048fbf2e7b2f214dcbe703ea3dec2b9647595e1
+# The VLLM_BATCH_INVARIANT=0 baseline actor (verl Megatron engine).
+ARG MEGATRON_BRIDGE_REPO=https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
+ARG MEGATRON_BRIDGE_REVISION=c0e164ed2aedac4ad1c877780e2564a19d5d54ec
+ARG DEEPEP_REPO=https://github.com/ISEEKYAN/DeepEP.git
+ARG DEEPEP_REVISION=2cd85412155cbc07452f552ac6e2f446a26f8869
+ARG NVSHMEM_VERSION=3.4.5
+ARG MAX_JOBS=64
+
+# -----------------------------------------------------------------------------
+# Builder
+# -----------------------------------------------------------------------------
+FROM ${BASE_IMAGE}@${BASE_IMAGE_DIGEST} AS builder
+ARG TARGETARCH
+ARG BASE_IMAGE_DIGEST
+ARG VLLM_REPO
+ARG VLLM_REF
+ARG VLLM_REVISION
+ARG VLLM_TREE
+ARG VLLM_VERSION
+ARG VLLM_TAG_REPO
+ARG VLLM_BASE_TAG
+ARG MEGATRON_REPO
+ARG MEGATRON_REVISION
+ARG CAUSAL_CONV1D_REVISION
+ARG MAMBA_SSM_REVISION
+ARG MEGATRON_BRIDGE_REPO
+ARG MEGATRON_BRIDGE_REVISION
+ARG DEEPEP_REPO
+ARG DEEPEP_REVISION
+ARG NVSHMEM_VERSION
+ARG MAX_JOBS
+
+ENV VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:/usr/local/bin:/usr/local/cuda/bin:/usr/bin:/bin \
+    MAX_JOBS=${MAX_JOBS} CMAKE_BUILD_PARALLEL_LEVEL=${MAX_JOBS} \
+    PIP_NO_CACHE_DIR=1 PYTHONDONTWRITEBYTECODE=1
+WORKDIR /src
+
+RUN apt-get -o APT::Sandbox::User=root update && \
+    apt-get -o APT::Sandbox::User=root install -y --no-install-recommends \
+      libdw-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# -----------------------------------------------------------------------------
+# Target architecture and source checkouts
+# x86_64: H100 (SM90), B200 (SM100), B300 (SM103)
+# arm64:  GB200 (SM100), GB300 (SM103)
+# -----------------------------------------------------------------------------
+RUN <<'EOF'
+set -eux
+case "${TARGETARCH}" in
+  amd64) torch_archs='9.0a;10.0a;10.3a' ;;
+  arm64) torch_archs='10.0a;10.3a' ;;
+  *) exit 64 ;;
+esac
+printf "export TORCH_CUDA_ARCH_LIST='%s'\n" "${torch_archs}" >/tmp/arch.env
+
+clone_exact() {
+  git init "/src/$1"
+  git -C "/src/$1" remote add origin "$2"
+  git -C "/src/$1" fetch --depth 1 origin "$3"
+  git -C "/src/$1" checkout --detach "$3"
+  test "$(git -C "/src/$1" rev-parse HEAD)" = "$3"
+}
+
+# vLLM keeps its history and upstream's release tag to derive its version.
+git init /src/vllm
+git -C /src/vllm remote add origin "${VLLM_REPO}"
+git -C /src/vllm fetch --no-tags origin "${VLLM_REF}"
+git -C /src/vllm checkout --detach "${VLLM_REVISION}"
+test "$(git -C /src/vllm rev-parse HEAD)" = "${VLLM_REVISION}"
+test "$(git -C /src/vllm rev-parse HEAD^{tree})" = "${VLLM_TREE}"
+git -C /src/vllm fetch --no-tags "${VLLM_TAG_REPO}" \
+  "refs/tags/${VLLM_BASE_TAG}:refs/tags/${VLLM_BASE_TAG}"
+
+clone_exact Megatron-LM "${MEGATRON_REPO}" "${MEGATRON_REVISION}"
+clone_exact Megatron-Bridge "${MEGATRON_BRIDGE_REPO}" "${MEGATRON_BRIDGE_REVISION}"
+clone_exact DeepEP "${DEEPEP_REPO}" "${DEEPEP_REVISION}"
+
+python3 -m pip install uv==0.12.5
+uv venv --seed --system-site-packages --python "$(command -v python3)" "${VIRTUAL_ENV}"
+EOF
+
+# -----------------------------------------------------------------------------
+# vLLM wheel built from the pinned source tree, against the base image's torch
+# -----------------------------------------------------------------------------
+RUN --mount=type=cache,target=/root/.cache/uv <<'EOF'
+set -eux
+. /tmp/arch.env
+cd /src/vllm
+uv pip install setuptools-scm==10.3.4
+test "$(python -m setuptools_scm)" = "${VLLM_VERSION}"
+# vLLM's supported way to build against a preinstalled torch.
+python tools/use_existing_torch.py
+# uv does not count the base image's packages as installed.
+printf '%s; sys_platform == "never"\n' torch torchvision torchaudio triton \
+  >/tmp/base-image-packages.txt
+uv pip install --override /tmp/base-image-packages.txt build -r requirements/build/cuda.txt
+uv pip install --override /tmp/base-image-packages.txt -r requirements/cuda.txt
+mkdir -p /tmp/wheels/vllm /opt/nemotron
+SETUPTOOLS_SCM_PRETEND_VERSION="${VLLM_VERSION}" python -m build --wheel \
+  --no-isolation --outdir /tmp/wheels/vllm /src/vllm
+wheel=$(find /tmp/wheels/vllm -maxdepth 1 -type f -name 'vllm-*.whl' -print -quit)
+test -n "${wheel}"
+sha256sum "${wheel}" | cut -d' ' -f1 >/opt/nemotron/vllm-wheel.sha256
+uv pip install --no-deps "${wheel}"
+EOF
+
+# -----------------------------------------------------------------------------
+# Megatron-LM, Mamba kernels and DeepEP (NVL4)
+# -----------------------------------------------------------------------------
+RUN --mount=type=cache,target=/root/.cache/uv <<'EOF'
+set -eux
+. /tmp/arch.env
+lite=/src/Megatron-LM/experimental/lite
+uv pip install --no-build-isolation --no-deps \
+  /src/Megatron-LM "${lite}" "${lite}/examples/verl" /src/Megatron-Bridge
+CAUSAL_CONV1D_FORCE_BUILD=TRUE MAMBA_FORCE_BUILD=TRUE \
+  uv pip install --no-build-isolation --no-deps \
+  "causal-conv1d @ git+https://github.com/Dao-AILab/causal-conv1d.git@${CAUSAL_CONV1D_REVISION}" \
+  "mamba-ssm @ git+https://github.com/state-spaces/mamba.git@${MAMBA_SSM_REVISION}"
+# Without NVSHMEM the DeepEP module does not load.
+uv pip install --no-deps "nvidia-nvshmem-cu13==${NVSHMEM_VERSION}"
+mkdir -p /tmp/wheels/deepep
+(cd /src/DeepEP && DEEPEP_NUM_MAX_NVL_PEERS=4 CPATH=/usr/local/cuda/include/cccl \
+  python -m pip wheel --no-deps --no-build-isolation -w /tmp/wheels/deepep .)
+uv pip install --no-deps /tmp/wheels/deepep/deep_ep-*.whl
+EOF
+
+# -----------------------------------------------------------------------------
+# VERL from this checkout, never replacing torch or vLLM
+# -----------------------------------------------------------------------------
+COPY . /src/verl
+RUN --mount=type=cache,target=/root/.cache/uv <<'EOF'
+set -eux
+test -z "$(git -C /src/verl status --porcelain --untracked-files=all)"
+git -C /src/verl rev-parse HEAD >/opt/nemotron/verl-revision
+uv pip freeze | grep -iE '^(torch|torchvision|torchaudio|vllm|flashinfer-python|transformers|megatron-core)==' \
+  >/tmp/constraints.txt
+grep -i '^transformers==' /tmp/constraints.txt | cat - /tmp/base-image-packages.txt >/tmp/overrides.txt
+# The Megatron Lite verl config needs omegaconf 2.4 (hydra-core 1.4).
+# Megatron-Bridge imports megatron.energon at load.
+uv pip install -c /tmp/constraints.txt --override /tmp/overrides.txt "/src/verl[verl-core]" \
+  hydra-core==1.4.0.dev8 megatron-energon==7.4.1
+install -D -m 0755 \
+  /src/verl/examples/grpo_trainer/run_nemotron_h_lightning_nvfp4_true_on_policy_megatron.sh \
+  /opt/nemotron/recipe/run_nemotron_h_lightning_nvfp4_true_on_policy_megatron.sh
+EOF
+
+# -----------------------------------------------------------------------------
+# Build smoke test and cleanup
+# -----------------------------------------------------------------------------
+RUN <<'EOF'
+set -eux
+# Transformer Engine loads libcuda at import; the build has no GPU driver.
+mkdir -p /tmp/cuda-stubs
+ln -s /usr/local/cuda/lib64/stubs/libcuda.so /tmp/cuda-stubs/libcuda.so.1
+LD_LIBRARY_PATH=/tmp/cuda-stubs${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}} python - <<'PY'
+import os
+
+import deep_ep  # noqa: F401
+import megatron.bridge.models.nemotronh  # noqa: F401
+import megatron.lite.model.nemotron_h.vllm.protocol  # noqa: F401
+import verl.trainer.main_ppo  # noqa: F401
+import verl_mlite.engine  # noqa: F401
+import vllm
+
+assert vllm.__version__ == os.environ["VLLM_VERSION"], vllm.__version__
+PY
+site=/opt/venv/lib/python3.12/site-packages
+for so in "${site}"/vllm/_C_stable_libtorch.abi3.so "${site}"/causal_conv1d_cuda*.so; do
+  cuobjdump --list-elf "${so}" | grep -Eq '\.sm_100a?\.'
+done
+printf '{"schema":"nemotron-h-true-on-policy-image/v4","base_image_digest":"%s","vllm_revision":"%s","vllm_tree":"%s","vllm_version":"%s","vllm_wheel_sha256":"%s","megatron_revision":"%s","verl_revision":"%s","causal_conv1d_revision":"%s","mamba_ssm_revision":"%s","deepep_revision":"%s","nvshmem_version":"%s"}\n' \
+  "${BASE_IMAGE_DIGEST}" "${VLLM_REVISION}" "${VLLM_TREE}" "${VLLM_VERSION}" \
+  "$(cat /opt/nemotron/vllm-wheel.sha256)" "${MEGATRON_REVISION}" \
+  "$(cat /opt/nemotron/verl-revision)" "${CAUSAL_CONV1D_REVISION}" \
+  "${MAMBA_SSM_REVISION}" "${DEEPEP_REVISION}" "${NVSHMEM_VERSION}" \
+  >/opt/nemotron/image-manifest.json
+rm -rf /src /tmp/wheels /tmp/arch.env /tmp/cuda-stubs /tmp/*.txt /root/.cache
+EOF
+
+# -----------------------------------------------------------------------------
+# Minimal runtime image
+# -----------------------------------------------------------------------------
+FROM ${BASE_IMAGE}@${BASE_IMAGE_DIGEST} AS runtime
+ARG TARGETARCH
+ARG BASE_IMAGE_DIGEST
+ARG VLLM_REVISION
+ARG MEGATRON_REVISION
+# BASH_ENV/ENV: the NGC shell hook (/etc/shinit_v2) selects GCP NCCL plugins on
+# hosts with RDMA NICs, and NCCL init then fails without /dev/infiniband.
+ENV VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:/usr/local/bin:/usr/local/cuda/bin:/usr/bin:/bin \
+    PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 \
+    BASH_ENV= ENV= \
+    HF_HUB_OFFLINE=1
+RUN apt-get -o APT::Sandbox::User=root update && \
+    apt-get -o APT::Sandbox::User=root install -y --no-install-recommends \
+      rdma-core libibverbs1 libdw1 pciutils procps && \
+    rm -rf /var/lib/apt/lists/*
+COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder /opt/nemotron /opt/nemotron
+LABEL ai.nemotron.arch="${TARGETARCH}" \
+      ai.nemotron.base.digest="${BASE_IMAGE_DIGEST}" \
+      ai.nemotron.vllm.revision="${VLLM_REVISION}" \
+      ai.nemotron.megatron.revision="${MEGATRON_REVISION}"
+WORKDIR /workspace

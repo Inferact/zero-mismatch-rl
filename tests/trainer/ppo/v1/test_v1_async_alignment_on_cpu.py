@@ -197,6 +197,22 @@ class TestHybridEngineDisabled:
         trainer.checkpoint_manager.update_weights.assert_not_called()
 
 
+class TestOldLogProbWeightSnapshot:
+    @pytest.mark.parametrize("parameter_sync_step,snapshots", [(1, False), (4, True)])
+    def test_snapshot_only_when_weights_drift_within_a_sync(self, monkeypatch, parameter_sync_step, snapshots):
+        # One update per sync leaves the actor at pi_old, so engines without
+        # CPU save/restore (e.g. mlite) can run strictly on-policy.
+        trainer = _make_trainer()
+        trainer.config = OmegaConf.create({"algorithm": {}})
+        trainer.parameter_sync_step = parameter_sync_step
+        trainer.local_trigger_step = 0
+        trainer.actor_rollout_wg = MagicMock()
+        monkeypatch.setattr(PPOTrainer, "_compute_old_log_prob", lambda self, batch, metrics: batch)
+
+        assert trainer._compute_old_log_prob("batch", {}) == "batch"
+        assert trainer.actor_rollout_wg.save_model_to_cpu.called is snapshots
+
+
 class TestFractionalWarmup:
     def _warmup_stub(self, *, train_batch_size=64, gen_batch_size=None, restored=0):
         data = {"train_batch_size": train_batch_size}

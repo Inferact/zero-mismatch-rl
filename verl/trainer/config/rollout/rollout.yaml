@@ -30,6 +30,11 @@ full_determinism: false
 # enable_full_determinism() when full_determinism is True.
 seed: 42
 
+# vLLM with data_parallel_size > 1: send every turn of a session (the caller's
+# sticky request_id) to one DP rank, chosen by a stable hash, so it reuses that
+# rank's prefix cache. False lets vLLM pick per request.
+pin_dp_rank_by_session: false
+
 # typically the same as data max prompt length
 # same as data.max_prompt_length if it exists
 prompt_length: ${oc.select:data.max_prompt_length,512}

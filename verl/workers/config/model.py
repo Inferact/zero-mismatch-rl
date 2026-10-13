@@ -39,6 +39,7 @@ class MtpConfig(BaseConfig):
     Training parameters:
         detach_encoder: Whether to detach encoder parameters during MTP training
         mtp_loss_scaling_factor: Loss scaling factor during MTP training
+        lr: Learning rate of the MTP parameters (Megatron); None uses the actor's
 
     vLLM rollout parameters:
         method: "mtp"
@@ -57,6 +58,7 @@ class MtpConfig(BaseConfig):
 
     detach_encoder: bool = False
     mtp_loss_scaling_factor: float = 0.1
+    lr: Optional[float] = None
 
     speculative_algorithm: str = "EAGLE"
     speculative_num_steps: int = 3

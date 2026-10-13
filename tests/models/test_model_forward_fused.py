@@ -126,6 +126,7 @@ def test_engine_hook_context_and_current_thd_arguments(monkeypatch):
     assert preprocess_calls == [
         {
             "pre_process": True,
+            "mamba_seq_idx": False,
             "use_fp8_padding": True,
             "min_local_rows": 64,
             "pad_to_length_bucket": None,
@@ -142,6 +143,13 @@ def test_engine_hook_context_and_current_thd_arguments(monkeypatch):
             "local_cp_size": None,
         },
     ]
+
+    # Packed Mamba sequences get their seq_idx on the fused path as well.
+    hybrid_model = Model(mff._HOOK_MODE)
+    hybrid_model.hybrid_layer_pattern = "M*M-"
+    preprocess_calls.clear()
+    mff.fused_forward_model_engine()(hybrid_model, input_ids, labels, {}, 0.7, True, 0, "dualpipev")
+    assert preprocess_calls[0]["mamba_seq_idx"] is True
 
     legacy_model = Model(mff._LEGACY_MODE)
     mff.fused_forward_model_engine()(legacy_model, input_ids, labels, {}, 0.5, True, 0)

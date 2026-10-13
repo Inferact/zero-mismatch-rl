@@ -174,6 +174,11 @@ class RolloutConfig(BaseConfig):
     # enable_full_determinism() when full_determinism is True.
     seed: int = 42
 
+    # vLLM with data_parallel_size > 1: send every turn of a session (the
+    # caller's sticky request_id) to one DP rank, chosen by a stable hash, so
+    # it reuses that rank's prefix cache. False lets vLLM pick per request.
+    pin_dp_rank_by_session: bool = False
+
     # Early termination threshold for multi-turn rollout in sglang.
     # Abort remaining requests when (1 - over_sample_rate) * total_requests are completed.
     over_sample_rate: float = 0.0

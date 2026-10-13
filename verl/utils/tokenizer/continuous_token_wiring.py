@@ -116,6 +116,9 @@ _MODEL_TYPE_TO_FAMILY: dict[str, ContinuousTokenModelFamily] = {
     "qwen3_moe": ContinuousTokenModelFamily.QWEN3,
     "qwen3_5": ContinuousTokenModelFamily.QWEN35,
     "qwen3_5_moe": ContinuousTokenModelFamily.QWEN35,
+    # Nemotron-H renders ChatML turns ending in "<|im_end|>\n" and stops
+    # generation at "<|im_end|>", the plain Qwen boundary.
+    "nemotron_h": ContinuousTokenModelFamily.QWEN,
     "minimax": ContinuousTokenModelFamily.MINIMAX,
     "minimax_text_01": ContinuousTokenModelFamily.MINIMAX,
     # MiniMax M2-series checkpoints share this root model_type. Exact config

@@ -12,14 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 from omegaconf import OmegaConf
 
 from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer, ReplayBufferAsync
 from verl.trainer.ppo.v1.trainer_base import PPOTrainer
+from verl.utils import tensordict_utils as tu
 
 
 class _StubTrainer(PPOTrainer):
@@ -121,9 +124,12 @@ def test_builtin_sync_failure_refill_forces_single_prompt_generation():
     assert sampler.gen_batch_size == 1
 
 
-def test_sync_failure_refill_overrides_dataloader_generation_batch_size():
+@pytest.mark.parametrize(
+    ("sampler_key", "value"), [("sync_refill_failed_groups", True), ("sync_over_provision_prompts", 2)]
+)
+def test_exact_prompt_counts_override_dataloader_generation_batch_size(sampler_key, value):
     trainer = _trainer_with_filter_groups({"enable": False})
-    trainer.config.trainer.v1.sampler.sync_refill_failed_groups = True
+    trainer.config.trainer.v1.sampler[sampler_key] = value
     trainer.config.data.update(
         {
             "train_files": [],
@@ -193,3 +199,50 @@ def test_update_actor_passes_score_centering_flag(score_centering):
     trainer._update_actor(batch, {})
 
     assert batch.extra_info["score_centering"] is score_centering
+
+
+def _over_provisioned_trainer(over_provision: int) -> _StubTrainer:
+    trainer = _trainer_with_filter_groups({"enable": False})
+    trainer.config.data.update({"train_batch_size": 4, "gen_batch_size": 1})
+    trainer.config.trainer.v1.sampler.sync_over_provision_prompts = over_provision
+    trainer.global_steps = 5
+    trainer._fetch_one_gen_batch = lambda: tu.get_tensordict(
+        tensor_dict={"uid": np.array([str(uuid.uuid4())], dtype=object), "raw_prompt": [[{"content": "p"}]]},
+        non_tensor_dict={},
+    )
+    trainer.submitted = []
+    trainer._submit_batch_to_rollout = trainer.submitted.append
+    return trainer
+
+
+@pytest.mark.parametrize(("over_provision", "expected_target"), [(0, None), (2, 4)])
+def test_sync_over_provision_submits_spare_prompts_and_stamps_target(over_provision, expected_target):
+    """The step launches train_batch_size + K prompts; the stamped target tells the
+    rollout how many groups to keep, so the replay buffer's batch stays train_batch_size."""
+    trainer = _over_provisioned_trainer(over_provision)
+
+    trainer._add_batch_to_generate()
+
+    (batch,) = trainer.submitted
+    assert len(batch) == 4 + over_provision
+    assert tu.get(batch, "__target_groups__") == expected_target
+    assert tu.get(batch, "global_steps") == 5
+
+
+@pytest.mark.parametrize(
+    "incompatible",
+    [
+        {"trainer_mode": "colocate_async"},
+        {"filter_groups": {"enable": True, "metric": "acc"}},
+        {"sync_refill_failed_groups": True},
+    ],
+)
+def test_sync_over_provision_rejects_paths_that_refill_or_evict_groups(incompatible):
+    trainer = _trainer_with_filter_groups(
+        incompatible.get("filter_groups", {"enable": False}), trainer_mode=incompatible.get("trainer_mode", "sync")
+    )
+    trainer.config.trainer.v1.sampler.sync_over_provision_prompts = 2
+    trainer.config.trainer.v1.sampler.sync_refill_failed_groups = incompatible.get("sync_refill_failed_groups", False)
+
+    with pytest.raises(ValueError, match="sync_over_provision_prompts requires trainer_mode=sync"):
+        trainer._sync_over_provision_prompts()

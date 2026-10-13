@@ -129,6 +129,9 @@ class BaseEngine:
         if self.is_mp_src_rank_with_outputs():
             assert "grad_norm" not in outputs["metrics"]
             outputs["metrics"]["grad_norm"] = grad_norm
+            mtp_grad_norm = getattr(self, "mtp_grad_norm", None)
+            if mtp_grad_norm is not None:
+                outputs["metrics"]["mtp_grad_norm"] = mtp_grad_norm
         return outputs
 
     def infer_batch(self, data: TensorDict, loss_function: Optional[Callable] = None) -> Any:

@@ -88,6 +88,8 @@ mtp:
 
   detach_encoder: False
   mtp_loss_scaling_factor: 0.1
+  # Learning rate of the MTP parameters; null uses the actor's.
+  lr: null
 
   speculative_algorithm: EAGLE
   speculative_num_steps: 3

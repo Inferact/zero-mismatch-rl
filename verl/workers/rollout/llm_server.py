@@ -20,6 +20,7 @@ Utility classes for manage and request LLM servers:
 import asyncio
 import logging
 import os
+import zlib
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -38,6 +39,13 @@ from verl.workers.rollout.utils import update_prometheus_config
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def session_dp_rank(session_id: str, dp_size: int) -> int:
+    """Stable DP rank for a session: every turn of a multi-turn session reaches
+    the same DP engine of its replica, so it reuses that engine's prefix cache.
+    CRC32, unlike ``hash()``, is the same in every process."""
+    return zlib.crc32(session_id.encode()) % dp_size
 
 
 class LLMServerClient:
@@ -94,6 +102,16 @@ class LLMServerClient:
         if getattr(self.config.actor_rollout_ref.rollout, "full_determinism", False):
             return request_id
         return uuid4().hex
+
+    def _dp_rank_kwargs(self, request_id: str) -> dict[str, int]:
+        # vLLM's DP load balancer otherwise picks the least-loaded engine per
+        # request, so a session's turns bounce across DP ranks and lose their
+        # prefix cache. The caller's request_id is the session id.
+        rollout = self.config.actor_rollout_ref.rollout
+        dp_size = rollout.get("data_parallel_size", 1)
+        if rollout.name != "vllm" or not rollout.get("pin_dp_rank_by_session", False) or dp_size <= 1:
+            return {}
+        return {"data_parallel_rank": session_dp_rank(str(request_id), dp_size)}
 
     @rollout_trace_op
     async def generate(
@@ -155,6 +173,7 @@ class LLMServerClient:
                 video_data=video_data,
                 **multimodal_kwargs,
                 **priority_kwargs,
+                **self._dp_rank_kwargs(request_id),
                 **kwargs,
             )
             global_steps = output.extra_fields.get("global_steps")

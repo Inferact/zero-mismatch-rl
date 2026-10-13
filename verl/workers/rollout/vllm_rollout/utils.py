@@ -219,9 +219,15 @@ class vLLMColocateWorkerExtension:
         return instance
 
     def _get_drafter_model(self):
-        """Return the drafter's model object, or None if unavailable."""
-        drafter = getattr(self.model_runner, "drafter", None)
-        return drafter.model if drafter is not None and hasattr(drafter, "model") else None
+        """Return the drafter's model object, or None if unavailable.
+
+        Model runner V1 holds it as ``drafter``, model runner V2 as ``speculator``.
+        """
+        for attr in ("drafter", "speculator"):
+            drafter = getattr(self.model_runner, attr, None)
+            if drafter is not None and getattr(drafter, "model", None) is not None:
+                return drafter.model
+        return None
 
     def _get_draft_model_config(self):
         """Return the draft model config from speculative_config, or None."""

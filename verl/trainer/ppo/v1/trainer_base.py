@@ -184,6 +184,27 @@ class PPOTrainer(ABC):
                 )
         return sampler_cls(**replay_buffer_kwargs)
 
+    def _sync_over_provision_prompts(self) -> int:
+        """Spare prompts launched per sync step; the rollout keeps the first train_batch_size groups."""
+        over_provision = int(self.config.trainer.v1.sampler.get("sync_over_provision_prompts", 0) or 0)
+        if over_provision == 0:
+            return 0
+        if over_provision < 0:
+            raise ValueError("trainer.v1.sampler.sync_over_provision_prompts must be non-negative")
+        filter_groups = self.config.algorithm.get("filter_groups", None)
+        if (
+            self.trainer_mode != "sync"
+            or (filter_groups is not None and filter_groups.get("enable", False))
+            or self.config.trainer.v1.sampler.get("sync_refill_failed_groups", False)
+        ):
+            # Those paths refill or evict groups themselves; the rollout-side cut assumes the
+            # step's prompts arrive as one batch whose surplus it discards.
+            raise ValueError(
+                "trainer.v1.sampler.sync_over_provision_prompts requires trainer_mode=sync without "
+                "algorithm.filter_groups or sync_refill_failed_groups"
+            )
+        return over_provision
+
     def _resolve_filter_groups_metric(self) -> str | None:
         """Resolve DAPO's group metric and verify that rollout computes it before sampling."""
         filter_groups = self.config.algorithm.get("filter_groups", None)
@@ -570,6 +591,10 @@ class PPOTrainer(ABC):
                 batch_size=sample_batch_size,
             )
             metrics.update(off_policy_metrics)
+            # e.g. rollout/groups_cut from an over-provisioning AgentFramework rollout.
+            pop_rollout_metrics = getattr(getattr(self, "agent_loop_manager", None), "pop_rollout_metrics", None)
+            if pop_rollout_metrics is not None:
+                metrics.update(pop_rollout_metrics(self.global_steps))
             batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
             self.on_sample_end()
 
@@ -728,7 +753,10 @@ class PPOTrainer(ABC):
         filter_groups = self.config.algorithm.get("filter_groups", None)
         dapo_enabled = bool(filter_groups is not None and filter_groups.get("enable", False))
         sync_refill_failed_groups = bool(self.config.trainer.v1.sampler.get("sync_refill_failed_groups", False))
-        requires_exact_refill = self.trainer_mode != "sync" or dapo_enabled or sync_refill_failed_groups
+        over_provision = self._sync_over_provision_prompts()  # also rejects incompatible modes up front
+        requires_exact_refill = (
+            self.trainer_mode != "sync" or dapo_enabled or sync_refill_failed_groups or over_provision > 0
+        )
         if requires_exact_refill:
             user_gen_batch_size = self.config.data.get("gen_batch_size", None)
             if user_gen_batch_size not in (None, 1):
@@ -1519,7 +1547,15 @@ class PPOTrainer(ABC):
     @SkipManager.annotate_tq(role="rollout_tq", phase="submit")
     def _add_batch_to_generate(self):
         """Add one training batch to the AgentLoopManager."""
-        batch = self._next_train_batch()
+        over_provision = self._sync_over_provision_prompts()
+        if over_provision == 0:
+            batch = self._next_train_batch()
+        else:
+            # The rollout keeps the first train_batch_size groups to finish and cuts the rest,
+            # so the replay buffer sees exactly train_batch_size terminal groups.
+            train_batch_size = self.config.data.train_batch_size
+            batch = self._next_train_batch(train_batch_size + over_provision)
+            tu.assign_non_tensor_data(batch, "__target_groups__", train_batch_size)
         self._submit_batch_to_rollout(batch)
 
     def prepare_step(self) -> dict:

@@ -305,6 +305,11 @@ trainer:
       # Whether sync trainers replace failed groups that have no trajectories
       sync_refill_failed_groups: False
 
+      # Sync trainers only: launch train_batch_size + this many prompts per step and train on the
+      # first train_batch_size groups to finish. The rollout must cut the rest (the batch carries
+      # __target_groups__ = train_batch_size); uni-agent's GatewayAgentFramework does.
+      sync_over_provision_prompts: 0
+
       # Custom sampler config
       custom_sampler:
 

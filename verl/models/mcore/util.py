@@ -17,6 +17,7 @@ import inspect
 import logging
 import math
 import os
+import warnings
 from dataclasses import fields, is_dataclass
 from typing import Literal
 
@@ -44,6 +45,11 @@ def _packed_seq_params_supports(field_name: str) -> bool:
     if is_dataclass(PackedSeqParams):
         return field_name in {field.name for field in fields(PackedSeqParams)}
     return field_name in getattr(PackedSeqParams, "__dataclass_fields__", {})
+
+
+def has_mamba_layers(model) -> bool:
+    """Whether an unwrapped mcore model has Mamba mixers that need packed-sequence seq_idx."""
+    return "M" in (getattr(model, "hybrid_layer_pattern", None) or "")
 
 
 def _compute_fp8_thd_align_size(align_size: int) -> tuple[int, int]:
@@ -242,6 +248,7 @@ def preprocess_thd_engine(
     min_local_rows: int | None = None,
     pad_to_length_bucket: int | None = None,
     cp_layout: ContextParallelLayout = "zigzag",
+    mamba_seq_idx: bool = False,
 ) -> tuple[torch.Tensor, PackedSeqParams, torch.Tensor | None]:
     """Pack nested THD sequences and shard their rows across CP ranks.
 
@@ -449,6 +456,17 @@ def preprocess_thd_engine(
             "Megatron-core version does not provide. Upgrade Megatron-core or use the zigzag layout."
         )
 
+    if mamba_seq_idx:
+        # Mamba mixers derive per-sequence seq_idx from it; without it a packed
+        # micro-batch is scanned as one sequence.
+        if cp_size == 1 and _packed_seq_params_supports("total_tokens"):
+            extra_packed_args["total_tokens"] = cu_seqlens_padded_cpu[-1]
+        else:
+            warnings.warn(
+                "Packed Mamba sequences get no seq_idx (needs CP=1 and PackedSeqParams.total_tokens); "
+                "each packed micro-batch is scanned as one sequence.",
+                stacklevel=2,
+            )
     packed_seq_params = PackedSeqParams(
         qkv_format="thd",
         cu_seqlens_q=cu_seqlens_padded,

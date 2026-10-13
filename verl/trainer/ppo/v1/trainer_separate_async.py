@@ -200,10 +200,13 @@ class PPOTrainerSeparateAsync(PPOTrainer):
 
         - local_trigger_step == 0: Current weights are π_old → save to CPU, compute directly.
         - local_trigger_step >= 1: Save current weights → restore π_old → compute → restore current.
+
+        With parameter_sync_step == 1 every step syncs its weights before the next one,
+        so the actor weights are π_old already and no CPU snapshot is needed.
         """
         rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
         bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
-        if bypass_recomputing_logprobs:
+        if bypass_recomputing_logprobs or self.parameter_sync_step == 1:
             return super()._compute_old_log_prob(batch, metrics)
 
         if self.local_trigger_step == 0:

@@ -280,6 +280,7 @@ actor_rollout_ref:
     top_p: 1
     full_determinism: false
     seed: 42
+    pin_dp_rank_by_session: false
     prompt_length: ${oc.select:data.max_prompt_length,512}
     response_length: ${oc.select:data.max_response_length,512}
     dtype: bfloat16
@@ -447,6 +448,7 @@ actor_rollout_ref:
       enable_rollout: false
       detach_encoder: false
       mtp_loss_scaling_factor: 0.1
+      lr: null
       speculative_algorithm: EAGLE
       speculative_num_steps: 3
       speculative_eagle_topk: 1
@@ -678,6 +680,7 @@ critic:
       enable_rollout: false
       detach_encoder: false
       mtp_loss_scaling_factor: 0.1
+      lr: null
       speculative_algorithm: EAGLE
       speculative_num_steps: 3
       speculative_eagle_topk: 1
@@ -973,6 +976,7 @@ trainer:
       max_off_policy_threshold: 8
       max_off_policy_strategy: drop
       sync_refill_failed_groups: false
+      sync_over_provision_prompts: 0
       custom_sampler:
         path: null
         name: null
