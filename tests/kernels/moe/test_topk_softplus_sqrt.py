@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 import vllm._custom_ops as ops
+from vllm import envs
 from vllm.model_executor.layers.fused_moe.config import (
     RoutingMethodType,
     get_routing_method_type,
@@ -386,6 +387,17 @@ def test_dsv4_fast_topk(
         rtol=2e-5,
     )
 
+    if envs.VLLM_BATCH_INVARIANT and num_tokens:
+        single_weights, single_ids = dsv4_topk(
+            gating_output[:1],
+            correction_bias,
+            indices_type,
+            1.5,
+            is_padding=is_padding[:1] if use_padding else None,
+        )
+        assert torch.equal(topk_ids[:1], single_ids)
+        assert torch.equal(topk_weights[:1], single_weights)
+
     if use_padding and num_tokens:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -396,6 +408,31 @@ def test_dsv4_fast_topk(
         graph.replay()
         assert (ids == -1).all()
         assert (weights == 0).all()
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
+def test_dsv4_topk_bi_triton_rows_ignore_batch(monkeypatch: pytest.MonkeyPatch):
+    """VLLM_BI_TOPK_TRITON: under batch invariance the per-row Triton kernel
+    gives every row the same bits at any M."""
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    monkeypatch.setattr(envs, "VLLM_BI_TOPK_TRITON", True)
+    torch.manual_seed(0)
+    logits = torch.randn((4096, 384), dtype=torch.float32, device="cuda") * 3
+    bias = torch.randn(384, dtype=torch.float32, device="cuda") * 0.1
+    weights, ids = dsv4_topk(logits, bias, torch.int32, 1.5)
+    ref_weights, ref_ids = _torch_topk_softplus_sqrt(
+        gating_output=logits,
+        topk=6,
+        renormalize=True,
+        routed_scaling_factor=1.5,
+        e_score_correction_bias=bias,
+    )
+    torch.testing.assert_close(ids, ref_ids.to(torch.int32), atol=0, rtol=0)
+    torch.testing.assert_close(weights, ref_weights, atol=2e-5, rtol=2e-5)
+    for m in (1, 8, 64, 512):
+        for rows in (slice(0, m), slice(4096 - m, 4096)):
+            w, i = dsv4_topk(logits[rows], bias, torch.int32, 1.5)
+            assert torch.equal(i, ids[rows]) and torch.equal(w, weights[rows]), m
 
 
 @pytest.mark.skipif(
