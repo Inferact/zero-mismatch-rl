@@ -1,0 +1,15 @@
+# Train-inference consistency replay experiment record: each variant changes exactly one variable; everything else stays fixed.
+purpose: "frozen-policy old-logprob replay"
+target: "bitwise selected-token raw logprob"
+rollout: "/absolute/path/to/frozen-rollout"      # raw framework batch, not exported scores
+checkpoint: "content id + pre-update recovery path"
+environment: "image digest, source+patch hashes, libraries, GPU"
+topology:
+  trainer: "TP/PP/CP/EP/DP"
+  rollout: "TP/PP/CP/EP/DP"
+state: "RNG, mutable buffers, Graph/cache and reset policy"
+budget: {max_runs: 3, timeout_seconds: 600}
+variants:
+  - {name: A, change: "none (A/A baseline)", cmd: "", output: "", exit: null, result: ""}
+  - {name: B, change: "none (A/A repeat)", cmd: "", output: "", exit: null, result: ""}
+  - {name: C, change: "packing reversed", cmd: "", output: "", exit: null, result: ""}

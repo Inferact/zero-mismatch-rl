@@ -1,0 +1,32 @@
+schema_version: 2
+
+model:
+  id: REQUIRED_MODEL_ID
+  display_name: REQUIRED_DISPLAY_NAME
+  architecture: null
+  config_fingerprint: null
+  trainer_revision: null
+  serving_revision: null
+  draft_revision: null
+
+lifecycle:
+  state: queued
+  stale: false
+  stale_reason: null
+  blocked_at: null
+  resume_state: null
+
+review:
+  author: null
+  reviewers: []
+
+checks:
+  contract_frozen: {status: not_verified, evidence: [], reason: null, audit: null}
+  serving_identity: {status: not_verified, evidence: [], reason: null, audit: null}
+  trainer_onboarding: {status: not_verified, evidence: [], reason: null, audit: null}
+  checkpoint_robustness: {status: not_verified, evidence: [], reason: null, audit: null}
+  export_conversion: {status: not_verified, evidence: [], reason: null, audit: null}
+  train_rollout_parity: {status: not_verified, evidence: [], reason: null, audit: null}
+  rl_smoke: {status: not_verified, evidence: [], reason: null, audit: null}
+  evaluation: {status: not_verified, evidence: [], reason: null, audit: null}
+  delivery: {status: not_verified, evidence: [], reason: null, audit: null}

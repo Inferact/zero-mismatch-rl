@@ -1,0 +1,20 @@
+# One per audited item, at <audit dir>/verdict.yaml, next to MANIFEST, R<n>-<reviewer>.md and RESPONSE-r<n>.md.
+# A gate verdict is referenced by the card check's `audit`; the validator checks every field below.
+check: REQUIRED_CHECK_NAME          # card check this audit closes; null for a code batch or plan revision
+subject:                            # exactly what was reviewed; any later change to it voids this verdict
+  kind: gate                        # gate | code_batch | plan_revision
+  ref: REQUIRED_REF                 # run id, commit range or plan_revision number
+  manifest: MANIFEST.txt            # in this directory: one "<sha256>  <path relative to the case>" line per reviewed file;
+                                    # a gate's manifest must list every evidence file of its card check, and a file that
+                                    # changes afterwards voids the verdict; a URL is never covered, so save web
+                                    # evidence into the case and cite the saved file
+  sha256: REQUIRED_SHA256           # sha256 of the manifest file
+depends_on: []                      # verdict.yaml paths of the code batches and plan revisions this subject was built on;
+                                    # followed transitively, and every verdict reached must be closed
+reviewers: []                       # the card's review.reviewers; never the author; each needs R1-<reviewer>.md here
+rounds: 0                           # at least 1 when closed
+findings: []                        # {id, reviewer (one of `reviewers`), severity: P0|P1|P2, outcome: open|fixed|withdrawn|human_accepted|recorded (P2 only), ref}
+open_p0: 0                          # must be 0 when closed; open findings are also counted from `findings`
+open_p1: 0
+human_decisions: []                 # {finding, decision, by, date}; required for every human_accepted finding
+status: open                        # closed only when no P0/P1 finding is open

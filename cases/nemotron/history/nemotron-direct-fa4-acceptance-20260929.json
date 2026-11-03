@@ -1,0 +1,64 @@
+{
+  "case": "Nemotron-H Lightning NVFP4 direct-FA4 r4",
+  "date_utc": "2026-09-29",
+  "scope": "historical summary; not final immutable-image acceptance",
+  "quality": {
+    "source": "quality/paired-audit-current-gate.json",
+    "task": "GSM8K",
+    "questions": 1319,
+    "bi0_correct": 1239,
+    "bi1_correct": 1240,
+    "both_correct": 1218,
+    "only_bi0": 21,
+    "only_bi1": 22,
+    "both_wrong": 58,
+    "absolute_percentage_point_gap": 0.0758150113722517,
+    "current_gate": "absolute score gap <= 1 percentage point",
+    "current_gate_pass": true,
+    "historical_96_percent_gate_is_not_current": true,
+    "bi1_exit_receipt": "recovered by separate hashed validator after original BI0-schema parser failed"
+  },
+  "rust_bench_first_round": {
+    "input_tokens_per_request": 8192,
+    "output_tokens_per_request": 1024,
+    "ignore_eos": true,
+    "same_node": true,
+    "same_image_digest": "sha256:13ea3b228a97a12482302341942fd1e5694395ad2c46f940de15fa8f4b4a7a1d",
+    "resolved_prefix_caching_enabled_both": true,
+    "prefix_cache_hits_both": 0,
+    "points": [
+      {"concurrency": 1, "bi0_output_tps": 220.9743624819037, "bi1_output_tps": 194.30662583531964, "bi1_loss_percent": 12.07},
+      {"concurrency": 8, "bi0_output_tps": 1516.453399406589, "bi1_output_tps": 1419.0560181522417, "bi1_loss_percent": 6.42},
+      {"concurrency": 32, "bi0_output_tps": 5708.895638825008, "bi1_output_tps": 4416.464768229018, "bi1_loss_percent": 22.64},
+      {"concurrency": 64, "bi0_output_tps": 8171.128798765684, "bi1_output_tps": 6205.149459042838, "bi1_loss_percent": 24.06}
+    ],
+    "status": "first-round high-concurrency deficit above 20 percent; multi-round audit not represented"
+  },
+  "rust_bench_three_rounds": {
+    "source": "bench/paired-audit.json",
+    "order": "AB/BA/AB",
+    "all_legs_clean_exit_and_package_stable": true,
+    "all_completed_inputs_and_outputs_match": true,
+    "median_points": [
+      {"concurrency": 1, "bi0_output_tps": 220.9743624819037, "bi1_output_tps": 192.87102622629425, "bi1_loss_percent": 12.71791711036656},
+      {"concurrency": 8, "bi0_output_tps": 1516.453399406589, "bi1_output_tps": 1419.0560181522417, "bi1_loss_percent": 6.422708491567253},
+      {"concurrency": 32, "bi0_output_tps": 5682.460130847716, "bi1_output_tps": 4416.464768229018, "bi1_loss_percent": 22.279001233042273},
+      {"concurrency": 64, "bi0_output_tps": 8171.128798765684, "bi1_output_tps": 6146.986718604892, "bi1_loss_percent": 24.771878280349156}
+    ],
+    "all_target_points_within_20_percent": false,
+    "cache_caveat": "BI0 round2 c64 had 4176 prefix-cache hits out of 2097152 input tokens; all other measured points had zero hits"
+  },
+  "diagnostic_profile": {
+    "workload": "64 requests x 8192 input + 256 output; first 150 worker iterations",
+    "scope": "DP0 kernel counts and summed GPU durations, not E2E wall time",
+    "bi1_computational_worker": "HummingStage4BenchWorker; same computational base as r4 DAPOColdPolicyWorkerSealed",
+    "shared_fi_physical_shadow_overlay": "not active in this worker; related environment variables alone do not activate it",
+    "bi0_kernel_count": 110128,
+    "bi1_kernel_count": 139804,
+    "bi0_moe_expert_gemm_calls": 7314,
+    "bi1_moe_expert_gemm_calls": 14870,
+    "bi0_mamba2_calls": 5267,
+    "bi1_mamba2_calls": 19826,
+    "shared_expert_kernel_attribution": "unconfirmed"
+  }
+}

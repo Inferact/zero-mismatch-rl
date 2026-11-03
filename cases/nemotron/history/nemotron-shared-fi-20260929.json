@@ -1,0 +1,165 @@
+{
+  "case": "Nemotron-H Lightning NVFP4 isolated shared-expert FlashInfer candidate",
+  "date_utc": "2026-09-29",
+  "scope": "historical θ0 numerical and performance evidence, not a promoted recipe",
+  "serving_worker_sha256": "86516c1126e8d0785ff2631c08292098488faa07c8ecec90204f4f570f1b5b8a",
+  "path": {
+    "runner": "V2 GPUModelRunner",
+    "shared_expert_linears_per_worker": 46,
+    "shared_expert_kernel": "NemotronSharedHummingScaleFI",
+    "routed_moe_layers_per_worker": 23,
+    "worker_receipts_checked": 4,
+    "attention": "default serving attention"
+  },
+  "numerical": {
+    "proxy_input_tokens": 8192,
+    "proxy_output_tokens": 1024,
+    "proxy_old_logprob_bitwise_mismatches": 0,
+    "full_theta0_input_tokens": 92,
+    "full_theta0_output_tokens": 743,
+    "full_theta0_old_logprob_bitwise_mismatches": 0,
+    "full_theta0_backward_passes_per_rank": 1,
+    "optimizer_steps": 0
+  },
+  "rust_bench": {
+    "source": "paired-bench/paired-audit.json",
+    "input_tokens_per_request": 8192,
+    "output_tokens_per_request": 1024,
+    "ignore_eos": true,
+    "same_node_and_image": true,
+    "order": "AB/BA/AB",
+    "median_points": [
+      {"concurrency": 1, "bi0_output_tps": 215.71046776630192, "bi1_output_tps": 188.99172560881811, "loss_percent": 12.38639108901779},
+      {"concurrency": 8, "bi0_output_tps": 1515.1236326446453, "bi1_output_tps": 1333.7198643550973, "loss_percent": 11.97286903728827},
+      {"concurrency": 32, "bi0_output_tps": 4762.201316253151, "bi1_output_tps": 4298.7750680292065, "loss_percent": 9.731345179429828},
+      {"concurrency": 64, "bi0_output_tps": 8102.504526868034, "bi1_output_tps": 6433.6442162396625, "loss_percent": 20.596845149476984}
+    ],
+    "all_target_points_within_20_percent": false,
+    "c64_round_losses_percent": [4.2575730183296745, 20.596845149476984, 25.14459888416898],
+    "c64_mean_ttft_ms_by_round": {
+      "bi0": [930.1806340117187, 1004.3499503164062, 901.5876690234378],
+      "bi1": [1324.4648855234375, 1457.9692942304694, 1230.0773925507808]
+    },
+    "c64_mean_tpot_ms_by_round": {
+      "bi0": [7.623134973519216, 6.6446832507560485, 6.582669468872191],
+      "bi1": [8.522306898410772, 8.521360162668767, 8.797279736459862]
+    },
+    "cache_caveat": "c64 round2 BI1 had 6768 prefix-cache hits and BI0 zero; round3 BI0 had 4176 and BI1 zero; round1 both zero",
+    "baseline_variability_caveat": "BI0 c32 median 4762 tok/s is below two roughly 5700 tok/s runs in the prior audited baseline"
+  },
+  "diagnostic_profile": {
+    "workload": "64 requests x 8192 input + 256 output; first 150 worker iterations",
+    "scope": "DP0 kernel name groups and summed GPU durations, not E2E wall time",
+    "old_bi1_humming_kernel_count": 14870,
+    "shared_fi_bi1_humming_kernel_count": 7510,
+    "old_bi1_dense_gemm_group_count": 9280,
+    "shared_fi_bi1_dense_gemm_group_count": 16640,
+    "shared_fi_bi1_all_to_all_kernel_count": 18400,
+    "shared_fi_bi1_mamba2_kernel_count": 19688,
+    "bi0_all_to_all_kernel_count_in_separate_trace": 18285,
+    "bi0_mamba2_kernel_count_in_separate_trace": 5267,
+    "bi1_extra_mamba_decode_kernel_counts_each": {
+      "_workspace_chunk_cumsum_fwd_kernel": 3634,
+      "_bmm_chunk_workspace_range_fwd_kernel": 3634,
+      "_chunk_scan_workspace_range_fwd_kernel": 3634,
+      "_fold_chunk_fwd_kernel": 3634
+    },
+    "historical_single_prepare_fusion_c64_changes_percent": [-3.27, -8.55],
+    "module_launch_attribution": "not fully established; group counts alone do not identify every callsite"
+  },
+  "scheduler_budget_32768_isolated_candidate": {
+    "source": "budget32768-paired-c64-r1",
+    "image_digest": "sha256:13ea3b228a97a12482302341942fd1e5694395ad2c46f940de15fa8f4b4a7a1d",
+    "bi0_batch_budget": 16384,
+    "bi1_batch_budget": 32768,
+    "proxy_old_logprob_bitwise_mismatches": 0,
+    "proxy_checked_tokens": 1024,
+    "full_theta0_old_logprob_bitwise_mismatches": 0,
+    "full_theta0_checked_tokens": 743,
+    "optimizer_steps": 0,
+    "order": "AB/BA/AB",
+    "concurrency": 64,
+    "input_tokens_per_request": 8192,
+    "output_tokens_per_request": 1024,
+    "requests_per_leg": 256,
+    "failed_requests_per_leg": 0,
+    "bi0_output_tps_by_round": [8649.038094485246, 7848.731445087023, 8234.07881935716],
+    "bi1_output_tps_by_round": [6515.230332222349, 6610.163487406363, 6099.771919777369],
+    "bi0_prefix_cache_hits_by_round": [0, 4176, 0],
+    "bi1_prefix_cache_hits_by_round": [0, 0, 0],
+    "bi0_median_output_tps": 8234.07881935716,
+    "bi1_median_output_tps": 6515.230332222349,
+    "bi1_median_loss_percent": 20.874812165922442,
+    "within_20_percent_at_c64": false,
+    "attention_block16_probe": {
+      "source": "budget32768-attnblock16-proxy-r1",
+      "requested_attention_block_size": 16,
+      "resolved_attention_block_size": 6768,
+      "mamba_block_size": 6768,
+      "proxy_bi_pd_status": "pass_on_original_effective_page_size",
+      "new_attention_backend_evidence": false
+    },
+    "diagnostic_profile": {
+      "workload": "64 requests x 8192 input + 1024 output; bounded first 300 worker iterations",
+      "scope": "DP0 kernel-name groups; GPU duration sums are not E2E wall time",
+      "bi0_kernel_count": 210193,
+      "bi1_kernel_count": 257093,
+      "bi0_mamba2_kernel_count": 8579,
+      "bi1_mamba2_kernel_count": 36133,
+      "bi0_all_to_all_kernel_count": 35535,
+      "bi1_all_to_all_kernel_count": 35535,
+      "bi0_expert_gemm_kernel_count": 14214,
+      "bi1_expert_gemm_kernel_count": 14514,
+      "bi0_attention_group_count": 1908,
+      "bi1_attention_group_count": 3708,
+      "causal_conv1d_update_count_each": 7061,
+      "bi1_extra_mamba_decode_kernel_count_each": 7061,
+      "bi1_scaled_fp8_quant_strided_group_count": 16068,
+      "module_launch_attribution": "incomplete; counts identify candidate callsites but not E2E causality"
+    },
+    "not_run": ["c1", "c8", "c32", "post-update policy synchronization", "GSM8K", "final immutable-image acceptance"]
+  },
+  "max_num_seqs_proxy_screen": {
+    "node": "<node>",
+    "scope": "five-layer inference-only proxy; not full-model or trainer acceptance",
+    "workload": "256 requests x 8192 input + 1024 output, c64, ignore EOS, after 64-request warmup",
+    "numeric_gate": "proxy BI/PD pass for both settings; 1024 scored PD tokens each",
+    "requests_completed_each": 256,
+    "failed_requests_each": 0,
+    "prefix_cache_hits_each": 0,
+    "server_exit_each": 0,
+    "max_num_seqs_64": {
+      "source": "budget32768-maxseq64-c64-proxy-r1",
+      "output_tps": 15641.220792488051,
+      "mean_ttft_ms": 265.0212116757812,
+      "mean_tpot_ms": 3.8337212135340297
+    },
+    "max_num_seqs_16": {
+      "source": "budget32768-maxseq16-c64-proxy-r1",
+      "output_tps": 10730.315215840294,
+      "mean_ttft_ms": 306.0735670781252,
+      "mean_tpot_ms": 4.494244515392074
+    },
+    "decision": "reject max_num_seqs=16; slower in proxy c64, no full-model upgrade",
+    "causal_attribution": "unproven; grid-padding hypothesis did not predict E2E throughput"
+  },
+  "batch_budget_65536_proxy_screen": {
+    "source": "budget65536-maxseq64-c64-proxy-r1",
+    "control_source": "budget32768-maxseq64-c64-proxy-r1",
+    "scope": "five-layer inference-only proxy; not full-model or trainer acceptance",
+    "workload": "256 requests x 8192 input + 1024 output, c64, ignore EOS, after 64-request warmup",
+    "numeric_gate": "proxy BI/PD pass in both arms; 1024 scored PD tokens each",
+    "requests_completed_each": 256,
+    "failed_requests_each": 0,
+    "prefix_cache_hits_each": 0,
+    "server_exit_each": 0,
+    "budget_32768_output_tps": 15641.220792488051,
+    "budget_65536_output_tps": 13906.897553785107,
+    "budget_32768_mean_ttft_ms": 265.0212116757812,
+    "budget_65536_mean_ttft_ms": 380.9734396953125,
+    "budget_32768_mean_tpot_ms": 3.8337212135340297,
+    "budget_65536_mean_tpot_ms": 4.231875876317355,
+    "decision": "reject 65536 budget; slower in proxy c64, no full-model upgrade"
+  },
+  "not_run_for_this_candidate": ["GSM8K", "post-update policy synchronization", "final immutable-image acceptance"]
+}
