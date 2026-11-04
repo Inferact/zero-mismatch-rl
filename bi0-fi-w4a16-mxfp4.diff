@@ -1,0 +1,12 @@
+62,64c62,64
+<     W4A16 with the CUDA expert LoRA and the canonical-slot combine (moe tree). Without BI the upstream MXFP4
+<     oracle picks the experts (moe_backend)."""
+<     from vllm.distributed.parallel_state import k31_bi_model
+---
+>     W4A16 with the CUDA expert LoRA; the canonical-slot combine (moe tree) only exists under BI. The FI GEMM and
+>     the CUDA expert LoRA are not BI-specific, so the batch-variant arm uses them too (fair BI=0 baseline)."""
+>     from vllm.distributed.parallel_state import k31_model
+67c67
+<     return moe.activation.value == "situ" and k31_bi_model(vllm_config) and cap is not None and cap.major == 10
+---
+>     return moe.activation.value == "situ" and k31_model(vllm_config) and cap is not None and cap.major == 10
