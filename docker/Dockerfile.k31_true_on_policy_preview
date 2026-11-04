@@ -1,0 +1,108 @@
+# syntax=docker/dockerfile:1.7
+
+# K31 true-on-policy preview image: the K31 vLLM base image plus exactly the K31 delivery delta. The build stage
+# compiles only the eight K31 CMake targets of the vLLM delivery tree (csrc/k31) and the mLite wheel (its K31 kernel
+# is compiled there too); the final stage lays those modules and the vLLM .py files the delivery branch changed over
+# the base image's vLLM install. Every other vLLM file, binaries included (_C, _moe_C, flash-attn, FlashMLA, DeepGEMM,
+# vllm-rs, ...), stays the base image's, byte for byte; install_k31.sh fails the build otherwise. Nothing is mounted,
+# patched or JIT-compiled at run time. docker/k31/*.sh are the same scripts the enroot dev-image build runs.
+#
+# Build context:
+#   vllm/               the full vLLM delivery tree: `git archive <vLLM K31 head>`, a branch on the commit the base
+#                       image's vLLM was built from (its installed .py files equal that commit's)
+#   vllm-changes.txt    git -C <vllm> diff --no-renames --name-status <base commit> <vLLM K31 head>
+#   vllm-base-files.txt git -C <vllm> ls-tree -r --name-only <base commit> -- vllm
+#   verl/               the verl delivery checkout
+#   megatron/           the Megatron-LM delivery checkout (experimental/lite)
+#   megatron-core/      megatron/core of the Megatron-LM commit that branch comes from (the K31 actor imports it
+#                       for pipeline parallelism); installed next to megatron.lite
+#
+# Build (on a host with docker and network access; configuring vLLM fetches its pinned CMake dependencies):
+#   mkdir ctx && git -C <vllm> archive <vllm head> --prefix=vllm/ | tar -x -C ctx
+#   git -C <vllm> diff --no-renames --name-status <base commit> <vllm head> > ctx/vllm-changes.txt
+#   git -C <vllm> ls-tree -r --name-only <base commit> -- vllm > ctx/vllm-base-files.txt
+#   git -C <verl> archive <verl head> --prefix=verl/ | tar -x -C ctx
+#   git -C <megatron> archive <megatron head> --prefix=megatron/ | tar -x -C ctx
+#   git -C <megatron> archive <megatron-core commit> megatron/core --prefix=megatron-core/ | tar -x -C ctx
+#   cp <verl>/docker/Dockerfile.k31_true_on_policy_preview ctx/Dockerfile
+#   docker build --platform linux/arm64 -t <private registry>/<repo>:<tag> \
+#     --build-arg BASE_IMAGE=<base image> --build-arg BASE_IMAGE_DIGEST=sha256:<digest> \
+#     --build-arg VLLM_COMMIT=<vllm head> --build-arg VLLM_BASE_COMMIT=<base commit> \
+#     --build-arg VERL_COMMIT=<verl head> --build-arg MEGATRON_COMMIT=<megatron head> \
+#     --build-arg MEGATRON_CORE_COMMIT=<megatron-core commit> ctx
+#   Push only to a private registry.
+#
+# The base image provides torch, CUDA 13.0 (nvcc), GCC 13, flashinfer (its CUTLASS headers build the K31 BI GEMM)
+# and TORCH_CUDA_ARCH_LIST; the K31 kernels are built for sm_100a and sm_103a (the build fails without a 10.x entry).
+ARG BASE_IMAGE
+ARG BASE_IMAGE_DIGEST
+
+FROM ${BASE_IMAGE}@${BASE_IMAGE_DIGEST} AS build
+SHELL ["/bin/bash", "-c"]
+ARG MAX_JOBS=64
+ARG NVCC_THREADS=2
+ARG VLLM_VERSION=0.22.0+k31
+ARG VLLM_COMMIT
+COPY vllm /src/vllm
+COPY vllm-changes.txt vllm-base-files.txt /src/
+COPY megatron/experimental/lite /src/mlite
+COPY megatron-core /src/mcore
+COPY verl/docker/k31 /src/k31
+RUN MAX_JOBS="${MAX_JOBS}" NVCC_THREADS="${NVCC_THREADS}" \
+    bash /src/k31/build_k31.sh /src/vllm /src/mlite /out /src/vllm-changes.txt /src/vllm-base-files.txt \
+    "${VLLM_VERSION}" "${VLLM_COMMIT}" /src/mcore \
+    && rm -rf /out/build
+
+FROM ${BASE_IMAGE}@${BASE_IMAGE_DIGEST}
+# The RUN heredocs are bash scripts (set -o pipefail), whatever /bin/sh the base image has.
+SHELL ["/bin/bash", "-c"]
+ARG BASE_IMAGE
+ARG BASE_IMAGE_DIGEST
+ARG VLLM_COMMIT
+ARG VLLM_BASE_COMMIT
+ARG VERL_COMMIT
+ARG MEGATRON_COMMIT
+ARG MEGATRON_CORE_COMMIT
+ENV PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 \
+    VLLM_NO_USAGE_STATS=1 DO_NOT_TRACK=1 \
+    VERL_ROOT=/opt/k31/verl MEGATRON_ROOT=/opt/k31/megatron
+
+COPY --from=build /out /opt/k31/build
+COPY verl /opt/k31/verl
+COPY megatron /opt/k31/megatron
+
+RUN <<'EOF'
+set -euo pipefail
+for v in VLLM_COMMIT VLLM_BASE_COMMIT VERL_COMMIT MEGATRON_COMMIT MEGATRON_CORE_COMMIT; do [[ -n "${!v}" ]] || { echo "${v} unset"; exit 1; }; done
+printf 'base_image %s@%s\nvllm %s (base %s)\nverl %s\nmegatron %s\nmegatron.core %s\n' "${BASE_IMAGE}" "${BASE_IMAGE_DIGEST}" \
+  "${VLLM_COMMIT}" "${VLLM_BASE_COMMIT}" "${VERL_COMMIT}" "${MEGATRON_COMMIT}" "${MEGATRON_CORE_COMMIT}" >/tmp/k31-sources
+bash /opt/k31/verl/docker/k31/install_k31.sh /opt/k31/build /tmp/k31-sources /opt/k31/verl /opt/k31/megatron
+rm -rf /opt/k31/build /tmp/k31-sources
+EOF
+
+# VERL dependencies.  Everything the image already ships stays at the image's
+# version (constraints from its own freeze); packaging is the one exception
+# (tensordict -> pyvers needs <26).  Packages whose metadata would pull another
+# torch / NCCL / dill / fsspec go in with --no-deps.
+RUN <<'EOF'
+set -euo pipefail
+python3 -m pip freeze | grep -v -E '^-e|@ file|^#|^packaging==' >/tmp/image-constraints.txt
+python3 -m pip install --no-cache-dir --no-build-isolation "antlr4-python3-runtime==4.9.3"
+python3 -m pip install --no-cache-dir --only-binary=:all: -c /tmp/image-constraints.txt \
+  "ray[default]==2.59.0" "hydra-core==1.3.2" "omegaconf==2.3.0" "pyvers==0.1.0" "packaging==25.0" \
+  orjson cloudpickle codetiming "pyarrow==26.0.0" "pandas==3.0.6" xxhash pybind11 \
+  math_verify latex2sympy2_extended
+python3 -m pip install --no-cache-dir --only-binary=:all: --no-deps \
+  "peft==0.18.1" "torchdata==0.11.0" "tensordict==0.10.0" "datasets==4.8.5" \
+  "multiprocess==0.70.19" "fla-core==0.5.0"
+python3 -c 'import torch, ray, hydra, tensordict, peft, datasets, fla.ops.kda; print(torch.__version__, torch.cuda.nccl.version())'
+rm -f /tmp/image-constraints.txt
+EOF
+# the dependency installs above must not have replaced any of the K31 overlay
+RUN /opt/k31/verify_k31.sh
+
+LABEL ai.k31.release="k31-true-on-policy-preview" \
+      ai.k31.base.digest="${BASE_IMAGE_DIGEST}" \
+      ai.k31.vllm.commit="${VLLM_COMMIT}" ai.k31.verl.commit="${VERL_COMMIT}" \
+      ai.k31.megatron.commit="${MEGATRON_COMMIT}"
+WORKDIR /workspace
