@@ -8,8 +8,8 @@ Zero-mismatch RL for Kimi-K3.1 (hybrid KDA linear attention + sparse MLA, MXFP4 
 |---|---|
 | Rollout | vLLM, TP8 / EP8 per replica, `VLLM_BATCH_INVARIANT=1` |
 | Trainer | Megatron-LM (mLite) + verl, PP4 / EP4, LoRA r=32 |
-| Evidence (BI on) | `actor/ppo_kl` = 0 at every step; rollout and trainer log-probs bit-identical |
-| Hardware | GB300 |
+| Evidence (BI on) | 100 DAPO steps with LoRA, rollout/trainer log-prob mismatch 0 at every step; AIME 24/25/26 mean@8 0.451 → 0.664, pass@8 0.633 → 0.867 |
+| Hardware | GB300 (100-step run: 4 nodes × 4 GPUs, rollout DP16/EP16, actor PP4×EP4) |
 
 ## What was hard: KDA
 
@@ -19,7 +19,15 @@ Other pieces: fixed-tree TP all-reduce and TP-ordered reduction (`reports/k31-tp
 
 ## BI rollout cost
 
-Same image and recipe, only `VLLM_BATCH_INVARIANT` switched. Serving bench with LoRA active (util 0.90, max_num_seqs 128): BI-off 1708 tok/s vs BI-on 1543 tok/s. RL step at rollout util 0.87, step 1: BI-off 1330 s vs BI-on 1525 s. Measurements are in progress; see `reports/bi0-bi1-claim-conditions.md`.
+Same image and recipe, only `VLLM_BATCH_INVARIANT` switched, LoRA on every request, rollout 2 × TP8/EP8 on 4 GB300 nodes.
+
+| Measure | BI off | BI on | BI cost |
+|---|---|---|---|
+| RL rollout phase, step 1, GPU memory utilization 0.87 | 353 s | 412 s | 17% longer |
+| Whole RL step, step 1 | 1330 s | 1525 s | 15% longer |
+| Serving with LoRA active, util 0.90, 128 concurrent | 1708 tok/s | 1543 tok/s | 9.7% lower |
+
+At utilization 0.82 the BI-off arm had less free KV cache than BI-on (larger CUDA-graph footprint) and its rollout was slower; the root cause is being measured. See `reports/bi0-bi1-claim-conditions.md`.
 
 ## Code
 
