@@ -19,7 +19,7 @@ This repository holds three things:
 
 | Family | Model | Status | Trainer | Evidence (BI on) | BI rollout overhead¹ |
 |---|---|---|---|---|---|
-| Sparse attention | [DeepSeek-V4-Flash](cases/deepseek-v4-flash/README.md) | ✅ Supported | Megatron-LM (mLite) + verl | 100 RL steps, KL = 0 at every step (32 GB200) | 8.7% lower RL rollout throughput |
+| Sparse attention | [DeepSeek-V4-Flash](cases/deepseek-v4-flash/README.md) | ✅ Supported | Megatron-LM (mLite) + verl | 100 RL steps, KL = 0 at every step (32 GB200); AMD MI355X: [verl#8505](https://github.com/verl-project/verl/pull/8505), [by hardware](cases/deepseek-v4-flash/recipe.md) | 8.7% lower RL rollout throughput |
 | Sparse attention | [DeepSeek-V4.1-Flash](cases/deepseek-v4.1-flash/README.md) | ✅ Supported | Megatron-LM (mLite) + verl | 84 DAPO steps, KL = 0 at every step; SWE-bench Pro agentic RL, 20 steps at 32K and 10 at 128K, 0 mismatch (64 GB200) | 2.3–7.2% longer RL rollout step |
 | Linear attention (hybrid) | [Nemotron-3.5-Lightning-30B-A3B](cases/nemotron/README.md) | ✅ Supported | Megatron-LM (mLite) + verl + uni-agent | SWE-bench Pro agentic RL, KL = 0 at every step (8 GB200 nodes per run) | 12.5% lower RL rollout throughput |
 
@@ -60,11 +60,15 @@ invariance there.
 |---|---|---|---|
 | NVIDIA GB200 | ✅ Validated | ✅ Validated | ✅ Validated |
 | NVIDIA H100 | ✅ Validated | — | — |
+| AMD MI355X | ✅ Validated | — | — |
 
 - `—`: not verified yet.
 - GB200 runs: DeepSeek-V4-Flash 100 RL steps on 32 GPUs; DeepSeek-V4.1-Flash
   every full-model run on 64 GPUs; Nemotron agentic RL on 8 nodes × 4 GPUs.
 - H100: DeepSeek-V4-Flash with the `--hardware h100` preset (8 nodes × 8, CP2).
+- AMD MI355X: [verl#8505](https://github.com/verl-project/verl/pull/8505),
+  36 RL steps at diff 0 (4 nodes × 8);
+  see [the recipe by hardware](cases/deepseek-v4-flash/recipe.md).
 
 ## Code branches
 
