@@ -1,0 +1,4 @@
+build/
+dist/
+*.egg-info/
+megatron/lite/primitive/kernels/_k31_mxfp4_dequant*.so
