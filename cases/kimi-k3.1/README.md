@@ -15,7 +15,7 @@ Zero-mismatch RL for Kimi-K3.1 (hybrid KDA linear attention + sparse MLA, MXFP4 
 
 KDA's prefill path (chunkwise, 64-token blocks) and decode path (per-token recurrence) round differently, and mixed batches route decode rows into the prefill path, so results depend on the batch. The deployed fix is chunk-form batch invariance (CF-BI): row t of a chunk depends only on the chunk entry state, rows < t and token t; decode keeps the entry state plus the rows already computed in the chunk and computes exactly that row, so prefill, decode and the trainer forward all evaluate the same expression in the same order (fixed 3xTF32 split, ascending k, log2-domain gates). See `reports/kda-cfbi-design.md`.
 
-Other pieces: fixed-tree TP all-reduce and TP-ordered reduction (`reports/k31-tp-ep-invariant-design.md`), FlashInfer W4A16 MoE with CUDA expert LoRA and fixed-order combine (`reports/DELIVERY-moe-fi-w4a16.md`), mLite K3.1 layout and CP=2 (`reports/c5-mlite-k31-layout.md`), deployment overlays (`reports/k31-bi-deploy.md`).
+Other pieces: fixed-tree TP all-reduce and TP-ordered reduction (`reports/k31-tp-ep-invariant-design.md`), FlashInfer W4A16 MoE with CUDA expert LoRA and fixed-order combine (`reports/DELIVERY-moe-fi-w4a16.md`), mLite K3.1 layout (`reports/c5-mlite-k31-layout.md`), CP=2 (experimental: bitwise vs CP=1 in microbenchmarks, no RL run yet), deployment overlays (`reports/k31-bi-deploy.md`).
 
 ## BI rollout cost
 

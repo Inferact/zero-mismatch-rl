@@ -57,7 +57,7 @@ the aligned rollout path, not just of one flag.
 | Attention | Sparse MLA + indexer | Sparse MLA + indexer, sliding window | Mamba-2 (decode replays the prefill chunk math) + fixed-split attention | KDA linear attention (decode computes its row of the chunk-form expression from the chunk entry state) + sparse MLA with stable top-k |
 | MoE | FP8, DeepGEMM, fixed-order sum | MXFP4 experts, MegaMoE, rank-ordered EP combine | NVFP4 (W4A16) experts, fixed slot order | MXFP4 experts, FlashInfer W4A16, CUDA expert LoRA, fixed-tree combine |
 | LoRA | — | — | — | ✅ All modules incl. experts, FP32 add with one rounding |
-| Training context parallel | ✅ CP4 | ✅ CP2, CP16 | ✅ CP2 | ✅ CP2 (bitwise vs CP1) |
+| Training context parallel | ✅ CP4 | ✅ CP2, CP16 | ✅ CP2 | 🧪 CP2 (experimental: bitwise vs CP1 in microbenchmarks, no RL run yet) |
 
 Data parallel > 1 needs a DeepEP / NIXL all-to-all
 backend on DeepSeek-V4-Flash; the default `allgather_reducescatter` breaks
