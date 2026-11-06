@@ -15,6 +15,23 @@ This repository holds three things:
   has exactly two commits: an unmodified upstream snapshot, then the
   zero-mismatch changes on top.
 
+## Why zero mismatch: REINFORCE Zero
+
+[REINFORCE Zero](https://github.com/hijkzzz/REINFORCE-Zero) shows what zero
+mismatch buys in practice. The gap between the rollout policy and the trainer
+has two sources:
+
+- **Weight lag**: rollouts come from older weights. This gap is smooth, and
+  ordinary importance sampling (IS) corrects it.
+- **Kernel mismatch**: rollout and training compute the same weights with
+  different kernels. This gap is spiky: with standard kernels the IS
+  diagnostic peaks at 442.54× its median, versus 1.50× with aligned kernels.
+
+Remove kernel mismatch with aligned kernels, as this repository does, and
+plain unclipped token-level IS is enough to correct weight lag. Asynchronous
+RL then trains stably through 20,000 policy updates, at 2.40× the
+training-step throughput of synchronous training.
+
 ## Support matrix
 
 | Family | Model | Status | Trainer | Evidence (BI on) | BI rollout overhead¹ |
