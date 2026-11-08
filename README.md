@@ -119,6 +119,13 @@ first commit message. The Kimi-K3.1 branches are a single snapshot commit of
 the working trees for now (no separate upstream commit yet). Changes that have since landed upstream are noted in the
 model's case README.
 
+## Acknowledgments
+
+We thank [RL-Kernel](https://github.com/RL-Align/RL-Kernel) from RL-Align for
+its support. RL-Kernel builds deterministic operators that keep rollout and
+training numerically aligned across engines and hardware, and it shares the
+goal of this repository: zero train-inference mismatch.
+
 ## License
 
 The skill and case notes on `main` are under [Apache-2.0](LICENSE). Each code
