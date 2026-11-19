@@ -101,6 +101,26 @@ Prefill 的 B/H/长度为 runtime，不作为编译实例分派依据。Decode �
 TypeError/ValueError；capture 内 prepare，或 autograd 开启且输入 requires-grad 时抛出 RuntimeError。
 有效输入须有限，kernel 运行时不扫描 NaN/Inf。
 
+## 合约指纹
+
+`kda_fp32_state.contract` 记录决定这些 kernel 输出 bit 的因素：合约 id、kernel 源码摘要、CuTe DSL 包、
+`CUTE_DSL_*` 环境变量和 GPU 型号，另记 torch、CUDA、驱动与 `ptxas` 版本供排查。请在 rollout 与 trainer
+进程各记录一份并比较：
+
+```python
+from vllm.models.kimi_k3.nvidia.kda_fp32_state import contract
+
+fingerprint = contract.contract_fingerprint()
+print(contract.fingerprint_digest(fingerprint))
+contract.assert_same_contract(other_process_fingerprint, fingerprint)
+contract.require_pinned_toolchain()
+```
+
+`assert_same_contract` 对可能改变 bit 的字段抛出 `ContractMismatch`，不比较仅供排查的字段，除非
+`informational=True`。`require_pinned_toolchain` 是可选检查，核对已安装的 CuTe DSL 与 tvm-ffi 是否等于
+`requirements.txt`。指纹一致只排除上述工具链差异，不证明逐位相同；仍以输出和状态的逐字节 dump 比对为准。
+改动导致输出 bit 变化时须提升 `CONTRACT_ID`。其它模块不调用本模块。
+
 ## 测试和性能
 
 ```bash
