@@ -17,6 +17,13 @@ pools, in-place/out-of-place commit with all acceptance counts, eager/Graph
 metadata updates and compile-cache reuse. Two matching GPUs are needed for
 complete-head sharding and cross-device PD transfer; these tests skip otherwise.
 
+`test_deploy_shape.py` runs the K3.1 per-rank head count of 96, which the other modules do
+not reach: it calls their shape-agnostic cases with `h=96` and restates the cases that
+hard-code a head count or a workspace too small for H=96 (prefill windows from 24 MiB to the
+default, mixed and empty lengths, pooled prefill, prefill Graph replay with dynamic metadata,
+Q1/Q4/Q6/Q8 decode, acceptance commit with Graph replay). `KDA_LONG_CASES=1` adds the 20K- and
+196K-token shapes. Tests skip unless the current GPU is SM100/SM103 (`conftest.py`).
+
 `test_numerics.py` uses an independent FP64 recurrence. Optional JSONL output
 appends per-case output/state NRMSE and maximum normalized errors; these are
 diagnostics rather than unagreed error thresholds. `fp64_reference.py` has no
