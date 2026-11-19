@@ -1,0 +1,8 @@
+{
+  "upstream_base": "5735778f43f7d94108d432706dc5b17765bf723a",
+  "source_base": "e6521408691ca3b95e47a138670966f4192ab2ef",
+  "candidate": "configurable-Q working tree",
+  "changes": "FP32-only facade and namespace; optional terminal-only multi-query state output added to kernels/api.py and kernels/decode_multi.py; checkpoint arithmetic retained. Other kernel executable code unchanged.",
+  "source_q46_manifest": "7edab8264a5931f27b486ac6237d2f0bb5c5acb7607ca8660c266b9ae4dfafba",
+  "reference_packaging": "fi_q8.py removes only trailing blank lines; numerical code unchanged; original measured hashes retained"
+}

@@ -1,0 +1,14 @@
+{
+  "all_position_cases": 384,
+  "checks": "Eager/Graph effective outputs, complete pools and all checkpoints; FP32/CF-BI checkpoints vs independent Q1 prefixes; FlashInfer grouped vs compact-indexed grouped",
+  "cycle_measurements": 6,
+  "dynamic_metadata": "Fixed Graph replay with changed device acceptance counts (0/Q) and reversed slots",
+  "fp64_records": 24,
+  "main_cases": 42,
+  "previous_configurable_q_checks": 586,
+  "production_source_matches_previous_validation": true,
+  "result": "PASS",
+  "scope": "Standalone kernel adapters, not full vLLM integration; no new multi-GPU consistency test in this experiment",
+  "smoke_cases": 2,
+  "source_verified_before_after": true
+}

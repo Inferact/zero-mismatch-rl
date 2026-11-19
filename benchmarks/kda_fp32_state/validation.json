@@ -1,0 +1,73 @@
+{
+  "status": "PASS",
+  "tests": 387,
+  "failures": 0,
+  "errors": 0,
+  "skipped": 0,
+  "smoke_tests": 11,
+  "environment": {
+    "torch": "2.14.0a0+b2c75dd062.nv26.09",
+    "cuda": "13.4",
+    "dsl": "4.8.1",
+    "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+    "gpus": [
+      "NVIDIA B300 SXM6 AC",
+      "NVIDIA B300 SXM6 AC"
+    ],
+    "driver": "615.71.10",
+    "nvlink": "NV18"
+  },
+  "source_snapshot_sha256": "01016f92fac321493e58b549758dd95dc2feb3d51edaf6439f21e1840c07495e",
+  "regression": {
+    "cases": 18,
+    "decode_cases": 12,
+    "prefill_cases": 6,
+    "range": [
+      0.9702038850342415,
+      1.0091845595187885
+    ],
+    "geomean": {
+      "decode": 0.9981831168092915,
+      "prefill-small": 0.9997007103801907,
+      "prefill-large": 0.998512272428129
+    },
+    "timing": "Graph-internal event nodes; one complete API call; 16 warmups + 80 samples, reset outside timing, rotated order, queued groups of eight; hot addresses; GPU0",
+    "input": "B64 indexed in-place Q1/Q4/Q6/Q8 with all checkpoints + commit; prefill lengths [0,17,4096] or [128+(i*97)%1024 for i in range(16)]; H12/16/32; seed 8841+Q+H; pool size 2B+1 reversed odd slots",
+    "baseline": "Frozen standalone configurable-Q implementation; original kernel hashes in kernel-mapping.json",
+    "decode_max_ratio": 1.0091845595187885
+  },
+  "accuracy": {
+    "cases": 12,
+    "lengths": [
+      8,
+      64,
+      4096,
+      32768
+    ],
+    "gates": [
+      "normal",
+      "open",
+      "saturated"
+    ],
+    "reference": "Independent FP64 recurrence; nonzero FP32 initial state, H3",
+    "maxima": {
+      "output": {
+        "nrmse": 0.0016692282438660762,
+        "max_normalized": 0.0032747801917573116
+      },
+      "state": {
+        "nrmse": 3.4838041828051194e-07,
+        "max_normalized": 5.81296665982371e-07
+      }
+    }
+  },
+  "scope": "Kernel-level prepared API; no framework routing/convolution/logits acceptance",
+  "terminal_only": {
+    "tests": 115,
+    "mode": "optional checkpoints; without checkpoints write final state only",
+    "native_cases": 84,
+    "position_cases": 768,
+    "complete_cycles": 12
+  },
+  "post_validation_changes": "Documentation and result packaging only; all production/test Python files are byte-identical to the measured snapshot."
+}

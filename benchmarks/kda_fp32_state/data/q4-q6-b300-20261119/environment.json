@@ -1,0 +1,15 @@
+{
+  "clock_control": "default; no override",
+  "cuda": "13.4",
+  "driver": "615.71.10",
+  "dsl": "4.8.1",
+  "gpus": [
+    "NVIDIA B300 SXM6 AC",
+    "NVIDIA B300 SXM6 AC"
+  ],
+  "nvlink": "NV18",
+  "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+  "snapshot": "7edab8264a5931f27b486ac6237d2f0bb5c5acb7607ca8660c266b9ae4dfafba",
+  "timed_gpus": 1,
+  "torch": "2.14.0a0+b2c75dd062.nv26.09"
+}
