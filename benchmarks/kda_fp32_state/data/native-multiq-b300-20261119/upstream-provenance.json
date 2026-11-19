@@ -1,0 +1,15 @@
+{
+  "repository": "Inferact/zero-mismatch-rl",
+  "commit": "5735778f43f7d94108d432706dc5b17765bf723a",
+  "branch": "vllm/kimi-k3.1",
+  "sha256": {
+    "csrc/k31/kda/kda_cfbi5_umma.cuh": "b4db99906f8dacd073faca1ad8d9e19174ee63ab67e9732353e5af492bf79bc1",
+    "csrc/k31/kda/kda_cfbi6.cu": "2a3e0df14685ea92bf7e928b9f13031fd20cf79a28a5b47597af885863a54277",
+    "csrc/k31/kda/kda_cfbi6_dsync8.cu": "7d7b826d867181df3401d7b9ad4e51cb8249cd6633ba0a01d91161e2727f123e",
+    "csrc/k31/kda/kda_cfbi6_mma.cuh": "1550ee1a25bffddcf029e72d5139c711be4f6963d6190002b6a5d81607eadb93",
+    "csrc/k31/kda/kda_cfbi6_pf4.cu": "de8341886814a2695307a96c0de22aed905e1d4776543854824f8a33528af239",
+    "csrc/k31/kda/kda_cfbi_v6.cu": "67b69af7730ae63e144f608a2bca6a1fa07fe87a0b42880a8771c82ac1f68795",
+    "vllm/models/kimi_k3/nvidia/k31_kda_cfbi.py": "0ddc69f0273f06729f4dd6204cf7dfc0319776eebc362d3d801b2de95d95d0e2",
+    "CMakeLists.txt": "09be19fdcc841fbc29b8389229c6c0222bbd20eeef3be8d637f95895989b1808"
+  }
+}

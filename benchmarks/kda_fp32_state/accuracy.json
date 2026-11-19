@@ -1,0 +1,146 @@
+[
+  {
+    "length": 8,
+    "gate": "normal",
+    "output": {
+      "nrmse": 0.001609982879706167,
+      "max_normalized": 0.0030421227348587103
+    },
+    "state": {
+      "nrmse": 4.92609347964884e-08,
+      "max_normalized": 8.580462244965852e-08
+    }
+  },
+  {
+    "length": 64,
+    "gate": "normal",
+    "output": {
+      "nrmse": 0.0016692282438660762,
+      "max_normalized": 0.0021690053102643428
+    },
+    "state": {
+      "nrmse": 7.319037550718068e-08,
+      "max_normalized": 8.481135292303208e-08
+    }
+  },
+  {
+    "length": 4096,
+    "gate": "normal",
+    "output": {
+      "nrmse": 0.0016575474115390833,
+      "max_normalized": 0.0025920519357886486
+    },
+    "state": {
+      "nrmse": 1.0714821194691929e-07,
+      "max_normalized": 1.9859771350336546e-07
+    }
+  },
+  {
+    "length": 32768,
+    "gate": "normal",
+    "output": {
+      "nrmse": 0.0016582864162048951,
+      "max_normalized": 0.0025513053770695473
+    },
+    "state": {
+      "nrmse": 6.564453063952235e-08,
+      "max_normalized": 1.5021503935981362e-07
+    }
+  },
+  {
+    "length": 8,
+    "gate": "open",
+    "output": {
+      "nrmse": 0.0016604236663558243,
+      "max_normalized": 0.0025573118218002373
+    },
+    "state": {
+      "nrmse": 7.302215265909698e-08,
+      "max_normalized": 1.989870195047468e-07
+    }
+  },
+  {
+    "length": 64,
+    "gate": "open",
+    "output": {
+      "nrmse": 0.0016426157448354896,
+      "max_normalized": 0.0032433791869210704
+    },
+    "state": {
+      "nrmse": 1.9922585213929987e-07,
+      "max_normalized": 4.803262818004267e-07
+    }
+  },
+  {
+    "length": 4096,
+    "gate": "open",
+    "output": {
+      "nrmse": 0.0016605354214370687,
+      "max_normalized": 0.0032747801917573116
+    },
+    "state": {
+      "nrmse": 3.4838041828051194e-07,
+      "max_normalized": 5.302051174781176e-07
+    }
+  },
+  {
+    "length": 32768,
+    "gate": "open",
+    "output": {
+      "nrmse": 0.0016579407253988728,
+      "max_normalized": 0.0031522259403554123
+    },
+    "state": {
+      "nrmse": 3.4430284811949765e-07,
+      "max_normalized": 5.81296665982371e-07
+    }
+  },
+  {
+    "length": 8,
+    "gate": "saturated",
+    "output": {
+      "nrmse": 0.0016615878987772574,
+      "max_normalized": 0.0021670550323092865
+    },
+    "state": {
+      "nrmse": 5.387128725426955e-08,
+      "max_normalized": 1.1430799822180972e-07
+    }
+  },
+  {
+    "length": 64,
+    "gate": "saturated",
+    "output": {
+      "nrmse": 0.0016496891777074381,
+      "max_normalized": 0.0022226530968842634
+    },
+    "state": {
+      "nrmse": 1.4269237894927704e-07,
+      "max_normalized": 3.3546451376861244e-07
+    }
+  },
+  {
+    "length": 4096,
+    "gate": "saturated",
+    "output": {
+      "nrmse": 0.0016557968651152671,
+      "max_normalized": 0.002144231584823356
+    },
+    "state": {
+      "nrmse": 2.4817845201653153e-07,
+      "max_normalized": 4.0243818758038527e-07
+    }
+  },
+  {
+    "length": 32768,
+    "gate": "saturated",
+    "output": {
+      "nrmse": 0.0016578996739798023,
+      "max_normalized": 0.002102277427735965
+    },
+    "state": {
+      "nrmse": 2.4750303577268385e-07,
+      "max_normalized": 3.914336094293186e-07
+    }
+  }
+]

@@ -1,0 +1,12 @@
+FlashInfer
+Copyright 2025-2026 NVIDIA
+Copyright 2023-2026 FlashInfer community (https://flashinfer.ai/)
+
+The recurrent one-warp KDA implementation is adapted from FlashInfer commit
+c3af0c13328fd23b256c53b9b4f94d9e160d118c under Apache-2.0.
+See FlashInfer-Apache-2.0.txt and source headers for licensing and changes.
+This subset does not include the persistent, static PTX, or TIRx KDA kernels.
+
+The FP32-state recurrent kernels retain this derivation. Changes include FP32
+continuation storage, packed f32x2 arithmetic, fixed reduction trees, staged
+varlen prefill, 256-bit state transfers and configurable-Q checkpoint output.

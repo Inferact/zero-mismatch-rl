@@ -1,0 +1,362 @@
+[
+  {
+    "q": 4,
+    "gate": "normal",
+    "implementation": "fp32_state",
+    "history_tokens": 60,
+    "total_tokens": 64,
+    "output": {
+      "nrmse": 0.001679958239121983,
+      "max_normalized": 0.003436283385467976
+    },
+    "state": {
+      "nrmse": 1.1275520078556172e-07,
+      "max_normalized": 1.7382736744567564e-07
+    }
+  },
+  {
+    "q": 4,
+    "gate": "normal",
+    "implementation": "flashinfer",
+    "history_tokens": 60,
+    "total_tokens": 64,
+    "output": {
+      "nrmse": 0.0016821280048967791,
+      "max_normalized": 0.003436283385467976
+    },
+    "state": {
+      "nrmse": 0.001668575869261598,
+      "max_normalized": 0.0026734586540623573
+    }
+  },
+  {
+    "q": 4,
+    "gate": "normal",
+    "implementation": "cfbi_c16",
+    "history_tokens": 60,
+    "total_tokens": 64,
+    "output": {
+      "nrmse": 0.001679958239121983,
+      "max_normalized": 0.003436283385467976
+    },
+    "state": {
+      "nrmse": 3.6376813182617606e-07,
+      "max_normalized": 7.162607352298078e-07
+    }
+  },
+  {
+    "q": 4,
+    "gate": "normal",
+    "implementation": "cfbi_c64",
+    "history_tokens": 60,
+    "total_tokens": 64,
+    "output": {
+      "nrmse": 0.0016799583382599175,
+      "max_normalized": 0.003436283385467976
+    },
+    "state": {
+      "nrmse": 4.5502998547387016e-07,
+      "max_normalized": 7.922452036712556e-07
+    }
+  },
+  {
+    "q": 4,
+    "gate": "open",
+    "implementation": "fp32_state",
+    "history_tokens": 60,
+    "total_tokens": 64,
+    "output": {
+      "nrmse": 0.001687533338406613,
+      "max_normalized": 0.002301785676052581
+    },
+    "state": {
+      "nrmse": 2.0330728399646944e-07,
+      "max_normalized": 4.899283892601995e-07
+    }
+  },
+  {
+    "q": 4,
+    "gate": "open",
+    "implementation": "flashinfer",
+    "history_tokens": 60,
+    "total_tokens": 64,
+    "output": {
+      "nrmse": 0.012293417349848977,
+      "max_normalized": 0.016952509509407118
+    },
+    "state": {
+      "nrmse": 0.012281309030083735,
+      "max_normalized": 0.030489840323459413
+    }
+  },
+  {
+    "q": 4,
+    "gate": "open",
+    "implementation": "cfbi_c16",
+    "history_tokens": 60,
+    "total_tokens": 64,
+    "output": {
+      "nrmse": 0.001687533338406613,
+      "max_normalized": 0.002301785676052581
+    },
+    "state": {
+      "nrmse": 3.131031042176707e-07,
+      "max_normalized": 3.9793270671194574e-07
+    }
+  },
+  {
+    "q": 4,
+    "gate": "open",
+    "implementation": "cfbi_c64",
+    "history_tokens": 60,
+    "total_tokens": 64,
+    "output": {
+      "nrmse": 0.001687533338406613,
+      "max_normalized": 0.002301785676052581
+    },
+    "state": {
+      "nrmse": 2.875652070553207e-07,
+      "max_normalized": 3.704377846377142e-07
+    }
+  },
+  {
+    "q": 4,
+    "gate": "saturated",
+    "implementation": "fp32_state",
+    "history_tokens": 60,
+    "total_tokens": 64,
+    "output": {
+      "nrmse": 0.0016356442371498997,
+      "max_normalized": 0.0028107749031441435
+    },
+    "state": {
+      "nrmse": 1.4828327145687817e-07,
+      "max_normalized": 3.888109066551305e-07
+    }
+  },
+  {
+    "q": 4,
+    "gate": "saturated",
+    "implementation": "flashinfer",
+    "history_tokens": 60,
+    "total_tokens": 64,
+    "output": {
+      "nrmse": 0.008950326251976759,
+      "max_normalized": 0.011533883241883707
+    },
+    "state": {
+      "nrmse": 0.008812864158606493,
+      "max_normalized": 0.020694894628197763
+    }
+  },
+  {
+    "q": 4,
+    "gate": "saturated",
+    "implementation": "cfbi_c16",
+    "history_tokens": 60,
+    "total_tokens": 64,
+    "output": {
+      "nrmse": 0.001635644237690763,
+      "max_normalized": 0.0028107749031441435
+    },
+    "state": {
+      "nrmse": 3.4238776542002255e-07,
+      "max_normalized": 4.932175494914387e-07
+    }
+  },
+  {
+    "q": 4,
+    "gate": "saturated",
+    "implementation": "cfbi_c64",
+    "history_tokens": 60,
+    "total_tokens": 64,
+    "output": {
+      "nrmse": 0.0016356442577109196,
+      "max_normalized": 0.0028107749031441435
+    },
+    "state": {
+      "nrmse": 3.4544905483117196e-07,
+      "max_normalized": 4.78440935325844e-07
+    }
+  },
+  {
+    "q": 6,
+    "gate": "normal",
+    "implementation": "fp32_state",
+    "history_tokens": 58,
+    "total_tokens": 64,
+    "output": {
+      "nrmse": 0.0016865465025342075,
+      "max_normalized": 0.0031229205338876046
+    },
+    "state": {
+      "nrmse": 7.750341588606846e-08,
+      "max_normalized": 1.0556094698413116e-07
+    }
+  },
+  {
+    "q": 6,
+    "gate": "normal",
+    "implementation": "flashinfer",
+    "history_tokens": 58,
+    "total_tokens": 64,
+    "output": {
+      "nrmse": 0.0016875414811355666,
+      "max_normalized": 0.0031229205338876046
+    },
+    "state": {
+      "nrmse": 0.0016663723119203144,
+      "max_normalized": 0.0027016465730361153
+    }
+  },
+  {
+    "q": 6,
+    "gate": "normal",
+    "implementation": "cfbi_c16",
+    "history_tokens": 58,
+    "total_tokens": 64,
+    "output": {
+      "nrmse": 0.0016865465028076795,
+      "max_normalized": 0.0031229205338876046
+    },
+    "state": {
+      "nrmse": 3.7248020603706517e-07,
+      "max_normalized": 8.053779742000612e-07
+    }
+  },
+  {
+    "q": 6,
+    "gate": "normal",
+    "implementation": "cfbi_c64",
+    "history_tokens": 58,
+    "total_tokens": 64,
+    "output": {
+      "nrmse": 0.0016865465026103523,
+      "max_normalized": 0.0031229205338876046
+    },
+    "state": {
+      "nrmse": 4.390928886520638e-07,
+      "max_normalized": 8.014291482240562e-07
+    }
+  },
+  {
+    "q": 6,
+    "gate": "open",
+    "implementation": "fp32_state",
+    "history_tokens": 58,
+    "total_tokens": 64,
+    "output": {
+      "nrmse": 0.0016341382076800858,
+      "max_normalized": 0.002137448532481267
+    },
+    "state": {
+      "nrmse": 2.009199195192659e-07,
+      "max_normalized": 4.796312931018122e-07
+    }
+  },
+  {
+    "q": 6,
+    "gate": "open",
+    "implementation": "flashinfer",
+    "history_tokens": 58,
+    "total_tokens": 64,
+    "output": {
+      "nrmse": 0.011968961627337528,
+      "max_normalized": 0.012917027174084526
+    },
+    "state": {
+      "nrmse": 0.012015838643086387,
+      "max_normalized": 0.02785708915641001
+    }
+  },
+  {
+    "q": 6,
+    "gate": "open",
+    "implementation": "cfbi_c16",
+    "history_tokens": 58,
+    "total_tokens": 64,
+    "output": {
+      "nrmse": 0.001634138214695874,
+      "max_normalized": 0.002137448532481267
+    },
+    "state": {
+      "nrmse": 3.081392733514475e-07,
+      "max_normalized": 3.5668843109884083e-07
+    }
+  },
+  {
+    "q": 6,
+    "gate": "open",
+    "implementation": "cfbi_c64",
+    "history_tokens": 58,
+    "total_tokens": 64,
+    "output": {
+      "nrmse": 0.001634138215155011,
+      "max_normalized": 0.002137448532481267
+    },
+    "state": {
+      "nrmse": 2.8530458183450897e-07,
+      "max_normalized": 3.5668843109884083e-07
+    }
+  },
+  {
+    "q": 6,
+    "gate": "saturated",
+    "implementation": "fp32_state",
+    "history_tokens": 58,
+    "total_tokens": 64,
+    "output": {
+      "nrmse": 0.0016319314323515431,
+      "max_normalized": 0.0022195549711968854
+    },
+    "state": {
+      "nrmse": 1.4574626924040914e-07,
+      "max_normalized": 3.7207726391758624e-07
+    }
+  },
+  {
+    "q": 6,
+    "gate": "saturated",
+    "implementation": "flashinfer",
+    "history_tokens": 58,
+    "total_tokens": 64,
+    "output": {
+      "nrmse": 0.00858126732885597,
+      "max_normalized": 0.008206748838658596
+    },
+    "state": {
+      "nrmse": 0.008672314965139438,
+      "max_normalized": 0.02524155858134146
+    }
+  },
+  {
+    "q": 6,
+    "gate": "saturated",
+    "implementation": "cfbi_c16",
+    "history_tokens": 58,
+    "total_tokens": 64,
+    "output": {
+      "nrmse": 0.0016319318347488261,
+      "max_normalized": 0.0022195549711968854
+    },
+    "state": {
+      "nrmse": 3.3879099579820053e-07,
+      "max_normalized": 5.000153028530331e-07
+    }
+  },
+  {
+    "q": 6,
+    "gate": "saturated",
+    "implementation": "cfbi_c64",
+    "history_tokens": 58,
+    "total_tokens": 64,
+    "output": {
+      "nrmse": 0.0016319318387865225,
+      "max_normalized": 0.0022195549711968854
+    },
+    "state": {
+      "nrmse": 3.4345065171397244e-07,
+      "max_normalized": 4.7416300302246924e-07
+    }
+  }
+]
