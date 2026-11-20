@@ -125,6 +125,30 @@ or scalar arguments raise TypeError/ValueError. Prepare during capture or
 requires-grad inputs with autograd enabled raise RuntimeError. Forward requires
 finite valid inputs; kernels do not scan for NaN/Inf at runtime.
 
+## Contract fingerprint
+
+`kda_fp32_state.contract` records what decides the bits these kernels produce: the
+contract id, a digest of the kernel sources, the CuTe DSL packages, `CUTE_DSL_*`
+environment variables and the GPU model, plus the torch, CUDA, driver and `ptxas`
+versions for diagnosis. Log it in the rollout and in the trainer process and compare:
+
+```python
+from vllm.models.kimi_k3.nvidia.kda_fp32_state import contract
+
+fingerprint = contract.contract_fingerprint()
+print(contract.fingerprint_digest(fingerprint))
+contract.assert_same_contract(other_process_fingerprint, fingerprint)
+contract.require_pinned_toolchain()
+```
+
+`assert_same_contract` raises `ContractMismatch` for the fields that can change the
+bits and ignores the diagnostic ones unless `informational=True`.
+`require_pinned_toolchain` is an opt-in check of the installed CuTe DSL and tvm-ffi
+against `requirements.txt`. Equal fingerprints rule out these toolchain differences;
+they do not prove bitwise equality, so the bytewise comparison of dumped outputs and
+states stays the gate. Bump `CONTRACT_ID` when a change alters output bits. No other
+module calls this one.
+
 ## Tests and measurements
 
 ```bash
